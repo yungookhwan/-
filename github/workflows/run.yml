@@ -1,0 +1,29 @@
+name: Commodity Data Collector
+
+on:
+  workflow_dispatch: # 웹에서 수동으로 '실행' 버튼을 누를 수 있게 해줌
+  schedule:
+    - cron: '0 23 * * 0-4' # 한국 시간 기준 매주 월~금 오전 8시 자동 실행 (UTC 23:00)
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 라이브러리 설치
+        run: |
+          pip install gspread google-auth
+
+      - name: 스크립트 실행
+        env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+        run: |
+          python main.py
