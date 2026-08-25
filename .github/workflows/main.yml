@@ -1,9 +1,9 @@
 name: Commodity Data Collector
 
 on:
-  workflow_dispatch: # 웹에서 수동으로 '실행' 버튼을 누를 수 있게 해줌
+  workflow_dispatch:
   schedule:
-    - cron: '0 23 * * 0-4' # 한국 시간 기준 매주 월~금 오전 8시 자동 실행 (UTC 23:00)
+    - cron: '0 23 * * 0-4' # 한국 시간 기준 월~금 오전 8시 실행
 
 jobs:
   run-pipeline:
@@ -20,10 +20,11 @@ jobs:
 
       - name: 라이브러리 설치
         run: |
-          pip install gspread google-auth
+          pip install gspread google-auth google-genai yfinance requests feedparser
 
-      - name: 스크립트 실행
+      - name: 파이프라인 실행
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python main.py
