@@ -3,7 +3,7 @@ name: Commodity Data Collector
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 23 * * 0-4' # 한국 시간 기준 월~금 오전 8시 실행
+    - cron: '0 23 * * 0-4' # 한국 시간(KST) 기준 월~금 오전 8시 실행
 
 jobs:
   run-pipeline:
@@ -20,7 +20,8 @@ jobs:
 
       - name: 라이브러리 설치
         run: |
-          pip install gspread google-auth google-genai yfinance requests feedparser
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: 파이프라인 실행
         env:
