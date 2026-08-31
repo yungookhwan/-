@@ -1,0 +1,5 @@
+google-generativeai
+gspread
+oauth2client
+feedparser
+yfinance
