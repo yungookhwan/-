@@ -12,16 +12,10 @@ from oauth2client.service_account import ServiceAccountCredentials
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
 
-# Gemini 모델 설정 (안정적인 기본 모델 지정)
-model = None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-    except Exception:
-        model = genai.GenerativeModel("gemini-pro")
 
-# 2. 모니터링 품목 및 검증된 Ticker/단위 매핑
+# 2. 품목별 정밀 티커 및 단위 환산 배수(multiplier) 설정
 ITEMS = {
     "유가(WTI)": {
         "ticker": "CL=F",
@@ -56,6 +50,7 @@ ITEMS = {
 }
 
 def get_market_price(ticker_symbol, multiplier=1.0):
+    """Yahoo Finance를 통해 최신 종가 수집 및 단위 환산"""
     try:
         ticker = yf.Ticker(ticker_symbol)
         hist = ticker.history(period="5d")
@@ -75,54 +70,47 @@ def get_market_price(ticker_symbol, multiplier=1.0):
     return 0.0, "0.00%"
 
 def analyze_news_with_gemini(item_name, query, price_str, change_str):
-    if not model:
-        return "MID", f"{item_name} 글로벌 공급망 및 시황 모니터링"
+    """구글 RSS 뉴스를 수집하여 실제 기사 기반 요약문 생성"""
+    encoded_query = quote(query)
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
+    feed = feedparser.parse(rss_url)
+    
+    titles = [entry.title for entry in feed.entries[:2] if hasattr(entry, 'title')]
+    news_context = " / ".join(titles) if titles else f"{item_name} 글로벌 수급 변동성 지속"
 
-    try:
-        encoded_query = quote(query)
-        rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
-        feed = feedparser.parse(rss_url)
-        
-        news_context = ""
-        for entry in feed.entries[:3]:
-            news_context += f"- {entry.title}\n"
-
-        if not news_context.strip():
-            news_context = f"{item_name} 수급 및 시장 변동성 지속"
-
-        prompt = f"""
-당신은 원자재 구매 전략 전문가입니다. 아래 정보를 바탕으로 시황을 1문장으로 요약하고 리스크를 평가하세요.
+    # AI 호출 시도 (여러 모델명 순차 탐색)
+    if GEMINI_API_KEY:
+        for model_name in ["gemini-1.5-flash-8b", "gemini-1.5-flash", "gemini-1.0-pro"]:
+            try:
+                m = genai.GenerativeModel(model_name)
+                prompt = f"""
+당신은 원자재 구매 전문가입니다. 아래 기사를 바탕으로 핵심 시황을 1문맥으로 간결히 요약하세요.
 [품목]: {item_name}
-[시세 변동]: {price_str} ({change_str})
-[최신 뉴스]:
-{news_context}
+[뉴스]: {news_context}
 
-반드시 아래 2줄 형식으로만 응답하세요:
-Risk_Level: [HIGH, MID, LOW 중 택1]
-Summary: [1문장 시황 요약 (70자 내외)]
+반드시 아래 포맷으로만 응답하세요.
+Risk_Level: MID
+Summary: 시황 뉴스 요약: [요약 내용]
 """
-        response = model.generate_content(prompt)
-        text = response.text.strip()
+                res = m.generate_content(prompt).text.strip()
+                risk_level = "MID"
+                summary = ""
+                for line in res.split("\n"):
+                    if "Risk_Level:" in line:
+                        risk_level = line.replace("Risk_Level:", "").strip()
+                    elif "Summary:" in line:
+                        summary = line.replace("Summary:", "").strip()
+                if summary:
+                    return risk_level, summary
+            except Exception:
+                continue
 
-        risk_level = "MID"
-        summary = ""
-
-        for line in text.split("\n"):
-            line = line.strip()
-            if line.startswith("Risk_Level:"):
-                risk_level = line.replace("Risk_Level:", "").strip().upper()
-            elif line.startswith("Summary:"):
-                summary = line.replace("Summary:", "").strip()
-
-        if not summary:
-            summary = text.replace("\n", " ")[:80]
-
-        return risk_level, summary
-    except Exception as e:
-        print(f"[{item_name}] Gemini 요약 에러: {e}")
-        return "MID", f"{item_name} 가격 변동 및 수급 동향 주시"
+    # AI 호출 실패 시 최신 뉴스 헤드라인을 그대로 요약문으로 안전하게 연결
+    risk_level = "HIGH" if "+" in change_str and float(change_str.replace("%","").replace("+","")) > 3.0 else "MID"
+    return risk_level, f"시황 뉴스 요약: {news_context[:90]}"
 
 def main():
+    # 한국 표준시(KST, UTC+9) 기준 당일 날짜
     kst = timezone(timedelta(hours=9))
     today_str = datetime.now(kst).strftime("%Y-%m-%d")
     
@@ -137,6 +125,7 @@ def main():
         final_rows.append(row)
         print(f"- {item}: {price} {meta['unit']} ({change_rate}) | {risk} | {summary}")
 
+    # 구글 스프레드시트 적재
     try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         key_dict = json.loads(GCP_SA_KEY)
