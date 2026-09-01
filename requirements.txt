@@ -3,3 +3,5 @@ gspread
 oauth2client
 feedparser
 yfinance
+requests
+beautifulsoup4
