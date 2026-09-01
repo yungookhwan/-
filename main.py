@@ -8,12 +8,12 @@ import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GCP_SA_KEY = os.environ.get("GCP_SA_KEY")
-
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    except Exception:
+        model = genai.GenerativeModel("gemini-pro")
 else:
     model = None
 
