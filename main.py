@@ -69,45 +69,49 @@ def get_market_price(ticker_symbol, multiplier=1.0):
         print(f"Price error ({ticker_symbol}): {e}")
     return 0.0, "0.00%"
 
+def calculate_risk_level(change_rate_str):
+    """정량 기준 Risk Level 확정: 1% 미만 LOW, 1%~3% MID, 3% 이상 HIGH"""
+    try:
+        clean_str = change_rate_str.replace('%', '').replace('+', '').strip()
+        rate = abs(float(clean_str))
+        if rate >= 3.0:
+            return "HIGH"
+        elif rate >= 1.0:
+            return "MID"
+        else:
+            return "LOW"
+    except Exception:
+        return "LOW"
+
 def analyze_news_with_gemini(item_name, query, price_str, change_str):
     """구글 RSS 뉴스를 수집하여 실제 기사 기반 요약문 생성"""
     encoded_query = quote(query)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(rss_url)
     
-    titles = [entry.title for entry in feed.entries[:2] if hasattr(entry, 'title')]
+    titles = [entry.title for entry in feed.entries[:3] if hasattr(entry, 'title')]
     news_context = " / ".join(titles) if titles else f"{item_name} 글로벌 수급 변동성 지속"
 
-    # AI 호출 시도 (여러 모델명 순차 탐색)
+    # AI 호출 시도
     if GEMINI_API_KEY:
-        for model_name in ["gemini-1.5-flash-8b", "gemini-1.5-flash", "gemini-1.0-pro"]:
+        for model_name in ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro"]:
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
-당신은 원자재 구매 전문가입니다. 아래 기사를 바탕으로 핵심 시황을 1문맥으로 간결히 요약하세요.
+당신은 원자재 구매 전문가입니다. 아래 기사를 바탕으로 핵심 시황을 1문장(70자 내외)으로 간결히 요약하세요.
+불필요한 인사말 없이 요약문만 작성하세요.
 [품목]: {item_name}
+[시세]: {price_str} ({change_str})
 [뉴스]: {news_context}
-
-반드시 아래 포맷으로만 응답하세요.
-Risk_Level: MID
-Summary: 시황 뉴스 요약: [요약 내용]
 """
-                res = m.generate_content(prompt).text.strip()
-                risk_level = "MID"
-                summary = ""
-                for line in res.split("\n"):
-                    if "Risk_Level:" in line:
-                        risk_level = line.replace("Risk_Level:", "").strip()
-                    elif "Summary:" in line:
-                        summary = line.replace("Summary:", "").strip()
-                if summary:
-                    return risk_level, summary
+                res = m.generate_content(prompt).text.strip().replace("\n", " ")
+                if res:
+                    return f"시황 요약: {res}"
             except Exception:
                 continue
 
-    # AI 호출 실패 시 최신 뉴스 헤드라인을 그대로 요약문으로 안전하게 연결
-    risk_level = "HIGH" if "+" in change_str and float(change_str.replace("%","").replace("+","")) > 3.0 else "MID"
-    return risk_level, f"시황 뉴스 요약: {news_context[:90]}"
+    # AI 호출 실패 시 최신 뉴스 헤드라인 기반 연결
+    return f"시황 요약: {news_context[:80]}"
 
 def main():
     # 한국 표준시(KST, UTC+9) 기준 당일 날짜
@@ -119,7 +123,12 @@ def main():
 
     for item, meta in ITEMS.items():
         price, change_rate = get_market_price(meta["ticker"], meta["multiplier"])
-        risk, summary = analyze_news_with_gemini(item, meta["search_query"], f"{price} {meta['unit']}", change_rate)
+        
+        # 1. 정량 룰 기반 위험도 확정 (1% 미만 = LOW, 1%~3% = MID, 3% 이상 = HIGH)
+        risk = calculate_risk_level(change_rate)
+        
+        # 2. 뉴스 요약 생성
+        summary = analyze_news_with_gemini(item, meta["search_query"], f"{price} {meta['unit']}", change_rate)
         
         row = [today_str, item, price, meta["unit"], change_rate, risk, summary]
         final_rows.append(row)
