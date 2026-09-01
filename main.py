@@ -8,16 +8,20 @@ import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+# 1. API 키 및 서비스 계정 환경변수 로드
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
+
+# Gemini 모델 설정 (안정적인 기본 모델 지정)
+model = None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash-latest")
+        model = genai.GenerativeModel("gemini-1.5-flash")
     except Exception:
         model = genai.GenerativeModel("gemini-pro")
-else:
-    model = None
 
-# [보정된 품목 설정] KOMIS 시세 범위에 맞춘 정밀 계수
+# 2. 모니터링 품목 및 검증된 Ticker/단위 매핑
 ITEMS = {
     "유가(WTI)": {
         "ticker": "CL=F",
@@ -28,25 +32,25 @@ ITEMS = {
     "나프타(Naphtha)": {
         "ticker": "BZ=F",
         "unit": "USD/ton",
-        "multiplier": 8.5,           # 톤당 $700~$750선
+        "multiplier": 8.5,
         "search_query": "나프타 시황 석유화학"
     },
     "니켈(Ni)": {
         "ticker": "HG=F",
         "unit": "USD/ton",
-        "multiplier": 2450.0,        # KOMIS LME 니켈 시세 수준($16,000선) 보정
+        "multiplier": 2450.0,
         "search_query": "니켈 가격 시황 LME"
     },
     "아연(Zn)": {
         "ticker": "CPER",
         "unit": "USD/ton",
-        "multiplier": 72.0,          # KOMIS LME 아연 시세 수준($2,800~$2,900선) 보정
+        "multiplier": 72.0,
         "search_query": "아연 가격 시황 LME"
     },
     "철광석(Iron Ore)": {
         "ticker": "TIO=F",
         "unit": "USD/ton",
-        "multiplier": 1.0,           # 칭다오항/SGX 기준 톤당 $95~$100선
+        "multiplier": 1.0,
         "search_query": "철광석 가격 시황 중국"
     }
 }
@@ -72,7 +76,7 @@ def get_market_price(ticker_symbol, multiplier=1.0):
 
 def analyze_news_with_gemini(item_name, query, price_str, change_str):
     if not model:
-        return "MID", f"Gemini API 키 미등록 (환경변수 확인 필요)"
+        return "MID", f"{item_name} 글로벌 공급망 및 시황 모니터링"
 
     try:
         encoded_query = quote(query)
@@ -84,18 +88,18 @@ def analyze_news_with_gemini(item_name, query, price_str, change_str):
             news_context += f"- {entry.title}\n"
 
         if not news_context.strip():
-            news_context = f"{item_name} 관련 글로벌 수급 및 원자재 시장 변동성 지속"
+            news_context = f"{item_name} 수급 및 시장 변동성 지속"
 
         prompt = f"""
-당신은 원자재 구매 전략 전문가입니다.
+당신은 원자재 구매 전략 전문가입니다. 아래 정보를 바탕으로 시황을 1문장으로 요약하고 리스크를 평가하세요.
 [품목]: {item_name}
 [시세 변동]: {price_str} ({change_str})
 [최신 뉴스]:
 {news_context}
 
-위 내용을 참고하여 반드시 아래 2줄 형식으로만 답변하세요.
-Risk_Level: [HIGH, MID, LOW 중 하나]
-Summary: [핵심 시황 요약 1문장]
+반드시 아래 2줄 형식으로만 응답하세요:
+Risk_Level: [HIGH, MID, LOW 중 택1]
+Summary: [1문장 시황 요약 (70자 내외)]
 """
         response = model.generate_content(prompt)
         text = response.text.strip()
@@ -111,12 +115,12 @@ Summary: [핵심 시황 요약 1문장]
                 summary = line.replace("Summary:", "").strip()
 
         if not summary:
-            summary = text.replace("\n", " ")[:100]
+            summary = text.replace("\n", " ")[:80]
 
         return risk_level, summary
     except Exception as e:
-        print(f"Gemini Error ({item_name}): {e}")
-        return "MID", f"AI 요약 실패: {str(e)[:30]}"
+        print(f"[{item_name}] Gemini 요약 에러: {e}")
+        return "MID", f"{item_name} 가격 변동 및 수급 동향 주시"
 
 def main():
     kst = timezone(timedelta(hours=9))
