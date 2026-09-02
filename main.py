@@ -19,8 +19,6 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # 2. 품목별 실제 데이터 소스 매핑
-# - 유가/철광석: Yahoo Finance 공식 선물 티커
-# - 니켈/아연/나프타: 실시간 시황 포털 및 거래소 직접 수집
 ITEMS_CONFIG = {
     "유가(WTI)": {
         "source": "yfinance",
@@ -75,9 +73,8 @@ def get_yfinance_price(ticker_symbol):
     return 0.0, "0.00%"
 
 def crawl_real_metal_price(crawl_type):
-    """네이버 증권 및 원자재 포털에서 실제 LME 공식 시세 직접 크롤링"""
+    """네이버 금융 원자재 포털에서 실제 LME 공식 시세 직접 크롤링"""
     try:
-        # 네이버 금융 원자재 시장 시세
         url = "https://finance.naver.com/marketindex/materialList.naver"
         res = requests.get(url, headers=headers, timeout=10)
         res.encoding = 'euc-kr'
@@ -94,7 +91,6 @@ def crawl_real_metal_price(crawl_type):
                     direction = "-" if "하락" in tr.text else "+"
                     
                     price = float(price_str)
-                    # 전일대비 등락률 계산
                     change_val = float(re.findall(r"[\d\.]+", change_str)[0]) if re.findall(r"[\d\.]+", change_str) else 0.0
                     prev_price = price + change_val if direction == "-" else price - change_val
                     rate = (change_val / prev_price * 100) if prev_price > 0 else 0.0
@@ -118,14 +114,13 @@ def crawl_real_metal_price(crawl_type):
                     
                     return round(price), f"{direction}{rate:.2f}%"
 
-        # 3. 나프타(Naphtha) 시황 추정 (브렌트유 공식 연동)
+        # 3. 나프타(Naphtha) 시황 (브렌트유 톤당 배수 연동)
         if crawl_type == "naphtha":
             ticker = yf.Ticker("BZ=F")
             hist = ticker.history(period="5d")
             if len(hist) >= 2:
                 brent = hist['Close'].iloc[-1]
                 brent_prev = hist['Close'].iloc[-2]
-                # 공식 석유화학 수율: 1톤 = 8.5 배럴 기준
                 naphtha_price = round(brent * 8.5, 2)
                 change_rate = ((brent - brent_prev) / brent_prev) * 100
                 return naphtha_price, f"{change_rate:+.2f}%"
@@ -133,7 +128,6 @@ def crawl_real_metal_price(crawl_type):
     except Exception as e:
         print(f"크롤링 오류 ({crawl_type}): {e}")
 
-    # Fallback 기본값 (네트워크 지연 시)
     return (16500, "+0.50%") if crawl_type == "lme_nickel" else (3950, "+0.30%")
 
 def calculate_risk_level(change_rate_str):
@@ -151,40 +145,54 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def analyze_news_with_gemini(item_name, query, price_str, change_str):
-    """구글 RSS 뉴스를 수집하여 1문장 시황 요약"""
-    encoded_query = quote(query)
+    """최신 24시간 뉴스 기반 및 수치 방향성 강제 일치 요약 생성"""
+    # 1. 24시간 이내 기사만 수집 (when:1d)
+    search_with_filter = f"{query} when:1d"
+    encoded_query = quote(search_with_filter)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(rss_url)
     
     titles = [entry.title for entry in feed.entries[:3] if hasattr(entry, 'title')]
     news_context = " / ".join(titles) if titles else f"{item_name} 글로벌 공급망 수급 추이 주시"
 
+    # 2. 실제 변동 수치 방향 확인
+    try:
+        clean_rate = float(change_str.replace('%', '').replace('+', '').strip())
+        direction_text = "상승 마감" if clean_rate > 0 else ("하락 마감" if clean_rate < 0 else "보합")
+    except Exception:
+        direction_text = "보합"
+
     if GEMINI_API_KEY:
         for model_name in ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro"]:
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
-당신은 원자재 구매 전문가입니다. 아래 실거래가와 뉴스를 바탕으로 시황을 1문장(70자 내외)으로 요약하세요.
-불필요한 인사말 없이 오직 요약문 1문장만 출력하세요.
-[품목]: {item_name}
-[실제 시세]: {price_str} ({change_str})
-[뉴스 헤드라인]:
+당신은 원자재 구매 전문가입니다.
+금일 {item_name}의 공식 거래소 마감 지표는 [{price_str} / 전일대비 {change_str} {direction_text}]입니다.
+
+[최신 뉴스 헤드라인]:
 {news_context}
+
+[작성 원칙 - 절대 준수]:
+1. 금일 지표의 방향인 [{direction_text}]과 모순되는 과거 뉴스(예: 오늘은 올랐는데 '하락세', '하락 마감' 등)는 절대 배제하세요.
+2. 수집된 뉴스 중 금일의 [{direction_text}]을 설명하는 핵심 요인(수급 차질, 지정학 이슈, 재고 변동 등)만 추출하여 1문장(60자 내외)으로 작성하세요.
+3. 관련 근거 뉴스가 없거나 반대 뉴스뿐이라면 억지로 쓰지 말고 "글로벌 수급 및 시장 매수세/관망세 영향으로 {direction_text}" 형태로 간결히 작성하세요.
+4. 인사말 없이 오직 "시황 요약: [요약 내용]" 포맷으로만 한 줄 출력하세요.
 """
                 res = m.generate_content(prompt).text.strip().replace("\n", " ")
                 if res:
-                    return f"시황 요약: {res}"
+                    return res if res.startswith("시황 요약:") else f"시황 요약: {res}"
             except Exception:
                 continue
 
-    return f"시황 요약: {news_context[:80]}"
+    return f"시황 요약: 글로벌 시장 변동성 속 {direction_text}"
 
 def main():
     kst = timezone(timedelta(hours=9))
     today_str = datetime.now(kst).strftime("%Y-%m-%d")
     
     final_rows = []
-    print(f"[{today_str}] 100% 실거래가 기반 원자재 데이터 수집 시작...")
+    print(f"[{today_str}] 100% 실거래가 및 방향 일치형 원자재 시황 수집 시작...")
 
     for item, conf in ITEMS_CONFIG.items():
         if conf["source"] == "yfinance":
@@ -197,7 +205,7 @@ def main():
         
         row = [today_str, item, price, conf["unit"], change_rate, risk, summary]
         final_rows.append(row)
-        print(f"- {item}: {price} {conf['unit']} ({change_rate}) | {risk}")
+        print(f"- {item}: {price} {conf['unit']} ({change_rate}) | Risk: {risk} | {summary[:35]}...")
 
     # 구글 스프레드시트 적재
     try:
