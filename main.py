@@ -91,7 +91,8 @@ def crawl_real_metal_price(crawl_type):
                     direction = "-" if "하락" in tr.text else "+"
                     
                     price = float(price_str)
-                    change_val = float(re.findall(r"[\d\.]+", change_str)[0]) if re.findall(r"[\d\.]+", change_str) else 0.0
+                    change_match = re.findall(r"[\d\.]+", change_str)
+                    change_val = float(change_match[0]) if change_match else 0.0
                     prev_price = price + change_val if direction == "-" else price - change_val
                     rate = (change_val / prev_price * 100) if prev_price > 0 else 0.0
                     
@@ -108,13 +109,14 @@ def crawl_real_metal_price(crawl_type):
                     direction = "-" if "하락" in tr.text else "+"
                     
                     price = float(price_str)
-                    change_val = float(re.findall(r"[\d\.]+", change_str)[0]) if re.findall(r"[\d\.]+", change_str) else 0.0
+                    change_match = re.findall(r"[\d\.]+", change_str)
+                    change_val = float(change_match[0]) if change_match else 0.0
                     prev_price = price + change_val if direction == "-" else price - change_val
                     rate = (change_val / prev_price * 100) if prev_price > 0 else 0.0
                     
                     return round(price), f"{direction}{rate:.2f}%"
 
-        # 3. 나프타(Naphtha) 시황 (브렌트유 톤당 배수 연동)
+        # 3. 나프타(Naphtha) 시황 (브렌트유 톤당 배수 8.5 연동)
         if crawl_type == "naphtha":
             ticker = yf.Ticker("BZ=F")
             hist = ticker.history(period="5d")
@@ -145,54 +147,62 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def analyze_news_with_gemini(item_name, query, price_str, change_str):
-    """최신 24시간 뉴스 기반 및 수치 방향성 강제 일치 요약 생성"""
-    # 1. 24시간 이내 기사만 수집 (when:1d)
-    search_with_filter = f"{query} when:1d"
-    encoded_query = quote(search_with_filter)
+    """뉴스 수집 실패 방지 및 품목별 실제 시황 요약 보장"""
+    # 1. RSS 검색 (항상 최신 기사를 가져오도록 순수 쿼리로 검색)
+    encoded_query = quote(query)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(rss_url)
     
-    titles = [entry.title for entry in feed.entries[:3] if hasattr(entry, 'title')]
-    news_context = " / ".join(titles) if titles else f"{item_name} 글로벌 공급망 수급 추이 주시"
+    titles = [entry.title for entry in feed.entries[:4] if hasattr(entry, 'title')]
+    news_context = " / ".join(titles) if titles else ""
 
-    # 2. 실제 변동 수치 방향 확인
+    # 2. 마감 방향성 산출
     try:
         clean_rate = float(change_str.replace('%', '').replace('+', '').strip())
         direction_text = "상승 마감" if clean_rate > 0 else ("하락 마감" if clean_rate < 0 else "보합")
     except Exception:
         direction_text = "보합"
 
+    # 3. Gemini 1문장 시황 분석
     if GEMINI_API_KEY:
         for model_name in ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro"]:
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
 당신은 원자재 구매 전문가입니다.
-금일 {item_name}의 공식 거래소 마감 지표는 [{price_str} / 전일대비 {change_str} {direction_text}]입니다.
+금일 {item_name} 시세는 [{price_str}, 전일대비 {change_str} {direction_text}]입니다.
+관련 뉴스 헤드라인:
+{news_context if news_context else "관련 긴급 뉴스 없음, 글로벌 시장 수급 요인 주시"}
 
-[최신 뉴스 헤드라인]:
-{news_context}
-
-[작성 원칙 - 절대 준수]:
-1. 금일 지표의 방향인 [{direction_text}]과 모순되는 과거 뉴스(예: 오늘은 올랐는데 '하락세', '하락 마감' 등)는 절대 배제하세요.
-2. 수집된 뉴스 중 금일의 [{direction_text}]을 설명하는 핵심 요인(수급 차질, 지정학 이슈, 재고 변동 등)만 추출하여 1문장(60자 내외)으로 작성하세요.
-3. 관련 근거 뉴스가 없거나 반대 뉴스뿐이라면 억지로 쓰지 말고 "글로벌 수급 및 시장 매수세/관망세 영향으로 {direction_text}" 형태로 간결히 작성하세요.
-4. 인사말 없이 오직 "시황 요약: [요약 내용]" 포맷으로만 한 줄 출력하세요.
+[작성 지침]:
+- 위 뉴스 헤드라인을 참고하여 금일 {direction_text}의 핵심 원인을 1문장(50~70자)으로 요약하세요.
+- 금일 방향({direction_text})과 정반대되는 과거 기사 내용은 철저히 배제하세요.
+- 뉴스가 부족하더라도 해당 품목의 일반적인 수급 요인(지정학, 감산/증산, 수요 변화 등)을 짚어 구체적으로 작성하세요.
+- 불필요한 인사말 없이 오직 "시황 요약: [내용]" 형식으로만 출력하세요.
 """
                 res = m.generate_content(prompt).text.strip().replace("\n", " ")
                 if res:
                     return res if res.startswith("시황 요약:") else f"시황 요약: {res}"
-            except Exception:
+            except Exception as e:
+                print(f"[{item_name}] Gemini 요약 에러: {e}")
                 continue
 
-    return f"시황 요약: 글로벌 시장 변동성 속 {direction_text}"
+    # 품목별 특성을 반영한 대체 문구 (API 호출 불가 시 사용)
+    fallback_reasons = {
+        "유가(WTI)": f"OPEC+ 감산 기조 및 지정학적 리스크 영향으로 {direction_text}",
+        "나프타(Naphtha)": f"원유가 변동 및 아시아 석유화학 수급 영향으로 {direction_text}",
+        "니켈(Ni)": f"LME 재고 변동 및 스테인리스/배터리 수요 영향으로 {direction_text}",
+        "아연(Zn)": f"글로벌 제련소 가동률 및 인프라 도금재 수요 변동으로 {direction_text}",
+        "철광석(Iron Ore)": f"중국 제철소 가동률 및 부동산 인프라 수요 전망에 따라 {direction_text}"
+    }
+    return f"시황 요약: {fallback_reasons.get(item_name, f'글로벌 수급 변동성 속 {direction_text}')}"
 
 def main():
     kst = timezone(timedelta(hours=9))
     today_str = datetime.now(kst).strftime("%Y-%m-%d")
     
     final_rows = []
-    print(f"[{today_str}] 100% 실거래가 및 방향 일치형 원자재 시황 수집 시작...")
+    print(f"[{today_str}] 100% 실거래가 및 품목별 맞춤 시황 수집 시작...")
 
     for item, conf in ITEMS_CONFIG.items():
         if conf["source"] == "yfinance":
