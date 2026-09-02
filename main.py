@@ -147,8 +147,7 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def analyze_news_with_gemini(item_name, query, price_str, change_str):
-    """뉴스 수집 실패 방지 및 품목별 실제 시황 요약 보장"""
-    # 1. RSS 검색 (항상 최신 기사를 가져오도록 순수 쿼리로 검색)
+    """뉴스 수집 및 Gemini 요약 (단일 표준 모델 및 동적 Fallback 적용)"""
     encoded_query = quote(query)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(rss_url)
@@ -156,38 +155,43 @@ def analyze_news_with_gemini(item_name, query, price_str, change_str):
     titles = [entry.title for entry in feed.entries[:4] if hasattr(entry, 'title')]
     news_context = " / ".join(titles) if titles else ""
 
-    # 2. 마감 방향성 산출
+    # 방향성 도출
     try:
         clean_rate = float(change_str.replace('%', '').replace('+', '').strip())
         direction_text = "상승 마감" if clean_rate > 0 else ("하락 마감" if clean_rate < 0 else "보합")
     except Exception:
         direction_text = "보합"
 
-    # 3. Gemini 1문장 시황 분석
+    # Gemini 호출 시도
     if GEMINI_API_KEY:
-        for model_name in ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-pro"]:
+        for model_name in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-flash"]:
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
 당신은 원자재 구매 전문가입니다.
 금일 {item_name} 시세는 [{price_str}, 전일대비 {change_str} {direction_text}]입니다.
 관련 뉴스 헤드라인:
-{news_context if news_context else "관련 긴급 뉴스 없음, 글로벌 시장 수급 요인 주시"}
+{news_context if news_context else "관련 긴급 속보 없음, 글로벌 시장 수급 관망"}
 
 [작성 지침]:
-- 위 뉴스 헤드라인을 참고하여 금일 {direction_text}의 핵심 원인을 1문장(50~70자)으로 요약하세요.
-- 금일 방향({direction_text})과 정반대되는 과거 기사 내용은 철저히 배제하세요.
-- 뉴스가 부족하더라도 해당 품목의 일반적인 수급 요인(지정학, 감산/증산, 수요 변화 등)을 짚어 구체적으로 작성하세요.
+- 위 뉴스 헤드라인을 바탕으로 금일 {direction_text}의 핵심 원인을 1문장(50~70자)으로 요약하세요.
+- 금일 방향({direction_text})과 모순되는 과거 기사 내용은 철저히 배제하세요.
+- 기사가 부족하더라도 당일 등락폭({change_str})과 해당 원자재의 일반적 수급 요인(지정학, 생산/재고 변동 등)을 반영해 구체적으로 서술하세요.
 - 불필요한 인사말 없이 오직 "시황 요약: [내용]" 형식으로만 출력하세요.
 """
                 res = m.generate_content(prompt).text.strip().replace("\n", " ")
                 if res:
                     return res if res.startswith("시황 요약:") else f"시황 요약: {res}"
             except Exception as e:
-                print(f"[{item_name}] Gemini 요약 에러: {e}")
+                print(f"[{item_name}] Gemini({model_name}) 호출 실패: {e}")
                 continue
 
-    # 품목별 특성을 반영한 대체 문구 (API 호출 불가 시 사용)
+    # Fallback 1: 당일 수집된 최신 뉴스 헤드라인이 있는 경우 헤드라인 기반 동적 문구 생성
+    if titles:
+        clean_headline = titles[0].split(" - ")[0] if " - " in titles[0] else titles[0]
+        return f"시황 요약: {clean_headline[:45]} 등 영향으로 {direction_text}"
+
+    # Fallback 2: 뉴스도 수집되지 않았을 때의 품목별 기본 문구
     fallback_reasons = {
         "유가(WTI)": f"OPEC+ 감산 기조 및 지정학적 리스크 영향으로 {direction_text}",
         "나프타(Naphtha)": f"원유가 변동 및 아시아 석유화학 수급 영향으로 {direction_text}",
@@ -202,7 +206,7 @@ def main():
     today_str = datetime.now(kst).strftime("%Y-%m-%d")
     
     final_rows = []
-    print(f"[{today_str}] 100% 실거래가 및 품목별 맞춤 시황 수집 시작...")
+    print(f"[{today_str}] 원자재 시황 및 실거래가 수집 시작...")
 
     for item, conf in ITEMS_CONFIG.items():
         if conf["source"] == "yfinance":
