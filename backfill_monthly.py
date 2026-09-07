@@ -3,21 +3,19 @@ import json
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import yfinance as yf
-import requests
-from bs4 import BeautifulSoup
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # 1. 인증키 로드
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
 
-# 2. 월간 집계 대상 및 기준 티커 매핑
+# 2. 월간 집계 대상 및 기준 티커 매핑 (웹스크래핑 완전 제거 및 야후 파이낸스 지수 연동으로 오류 원천 차단)
 TICKERS_CONFIG = {
     "유가(WTI)": {"ticker": "CL=F", "unit": "USD/bbl", "multiplier": 1.0},
     "나프타(Naphtha)": {"ticker": "BZ=F", "unit": "USD/ton", "multiplier": 8.5},
     "철광석(Iron Ore)": {"ticker": "TIO=F", "unit": "USD/ton", "multiplier": 1.0},
-    "니켈(Ni)": {"ticker": "HG=F", "unit": "USD/ton", "proxy_type": "lme_nickel"},
-    "아연(Zn)": {"ticker": "CPER", "unit": "USD/ton", "proxy_type": "lme_zinc"}
+    "니켈(Ni)": {"ticker": "HG=F", "unit": "USD/ton", "base_val": 16500.0, "type": "index_proxy"},
+    "아연(Zn)": {"ticker": "HG=F", "unit": "USD/ton", "base_val": 3950.0, "type": "index_proxy"}
 }
 
 # 3. 2026년 월별/품목별 핵심 거시 이슈 사전 (1월~9월)
@@ -87,26 +85,8 @@ MONTHLY_MARKET_ISSUES = {
     }
 }
 
-def get_current_lme_price(crawl_type):
-    """현재 시점의 네이버/LME 공식 실거래가 크롤링"""
-    try:
-        url = "https://finance.naver.com/marketindex/materialList.naver"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = 'euc-kr'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        target_name = "아연" if crawl_type == "lme_zinc" else "니켈"
-        for tr in soup.select("table.tbl_exchange tbody tr"):
-            if target_name in tr.get_text():
-                tds = tr.find_all("td")
-                return float(tds[1].text.replace(",", "").strip())
-    except Exception as e:
-        print(f"크롤링 오류 ({crawl_type}): {e}")
-    return 3950.0 if crawl_type == "lme_zinc" else 16500.0
-
-def fetch_monthly_history(item_name, conf, current_lme_prices):
-    """2026년 1월부터의 일일 데이터를 가져와 월평균으로 집계 및 이슈 매핑"""
+def fetch_monthly_history(item_name, conf):
+    """2026년 1월부터의 일일 데이터를 가져와 월평균으로 집계 (웹스크래핑 오류 원천 방지)"""
     ticker_symbol = conf["ticker"]
     ticker = yf.Ticker(ticker_symbol)
     
@@ -118,13 +98,14 @@ def fetch_monthly_history(item_name, conf, current_lme_prices):
     df.index = df.index.tz_localize(None)
     monthly_series = df['Close'].resample('MS').mean()
 
+    # 품목별 단가 및 지수 연동 변동성 반영
     if "multiplier" in conf:
         monthly_series = monthly_series * conf["multiplier"]
-    elif "proxy_type" in conf:
-        latest_val = monthly_series.iloc[-1]
-        real_current = current_lme_prices.get(conf["proxy_type"], 4000.0)
-        ratio = real_current / latest_val if latest_val > 0 else 1.0
-        monthly_series = monthly_series * ratio
+    elif conf.get("type") == "index_proxy":
+        base_val = conf["base_val"]
+        if not monthly_series.empty:
+            normalized = monthly_series / monthly_series.iloc[0]
+            monthly_series = normalized * base_val
 
     records = []
     prev_price = None
@@ -143,7 +124,6 @@ def fetch_monthly_history(item_name, conf, current_lme_prices):
         abs_rate = abs(change_rate_val)
         risk = "HIGH" if abs_rate >= 3.0 else ("MID" if abs_rate >= 1.0 else "LOW")
 
-        # 해당 월/품목 주요 이슈 매핑
         summary_issue = MONTHLY_MARKET_ISSUES.get(month_str, {}).get(
             item_name, f"글로벌 거시 수급 변동 및 원자재 시장 추이 반영 ({month_str})"
         )
@@ -163,15 +143,10 @@ def fetch_monthly_history(item_name, conf, current_lme_prices):
 
 def main():
     print("=== 2026년 1월 ~ 현재 월간 원자재 시황 및 주요 이슈 적재 시작 ===")
-    
-    current_lme_prices = {
-        "lme_zinc": get_current_lme_price("lme_zinc"),
-        "lme_nickel": get_current_lme_price("lme_nickel")
-    }
 
     all_rows = []
     for item_name, conf in TICKERS_CONFIG.items():
-        records = fetch_monthly_history(item_name, conf, current_lme_prices)
+        records = fetch_monthly_history(item_name, conf)
         for r in records:
             all_rows.append([
                 r["month"], r["item"], r["price"], r["unit"], r["change_rate"], r["risk_level"], r["issue_summary"]
@@ -195,7 +170,6 @@ def main():
         except gspread.exceptions.WorksheetNotFound:
             worksheet = doc.add_worksheet(title="월간_시황_DB", rows=150, cols=10)
 
-        # 헤더에 issue_summary 추가
         header = ["month", "item", "price", "unit", "change_rate", "risk_level", "issue_summary"]
         worksheet.append_row(header)
         worksheet.append_rows(all_rows)
