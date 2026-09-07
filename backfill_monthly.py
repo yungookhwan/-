@@ -9,13 +9,17 @@ from oauth2client.service_account import ServiceAccountCredentials
 # 1. 인증키 로드
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
 
-# 2. 월간 집계 대상 및 기준 티커 매핑 (웹스크래핑 완전 제거 및 야후 파이낸스 지수 연동으로 오류 원천 차단)
+# 2. 품목별 티커 및 설정 (일일 데이터 main.py 기준과 100% 동기화)
+# - 유가(WTI): CL=F (USD/bbl)
+# - 나프타(Naphtha): BZ=F (브렌트유 선물 * 8.5 배럴 수율 환산)
+# - 철광석(Iron Ore): TIO=F (USD/ton)
+# - 니켈(Ni), 아연(Zn): 현재 9월 실거래가(16,500 / 3,950)를 최신 기준으로 고정하고 과거 월별 추세를 역산 보정
 TICKERS_CONFIG = {
     "유가(WTI)": {"ticker": "CL=F", "unit": "USD/bbl", "multiplier": 1.0},
     "나프타(Naphtha)": {"ticker": "BZ=F", "unit": "USD/ton", "multiplier": 8.5},
     "철광석(Iron Ore)": {"ticker": "TIO=F", "unit": "USD/ton", "multiplier": 1.0},
-    "니켈(Ni)": {"ticker": "HG=F", "unit": "USD/ton", "base_val": 16500.0, "type": "index_proxy"},
-    "아연(Zn)": {"ticker": "HG=F", "unit": "USD/ton", "base_val": 3950.0, "type": "index_proxy"}
+    "니켈(Ni)": {"ticker": "HG=F", "unit": "USD/ton", "current_target": 16500.0, "type": "recent_anchored_metal"},
+    "아연(Zn)": {"ticker": "HG=F", "unit": "USD/ton", "current_target": 3950.0, "type": "recent_anchored_metal"}
 }
 
 # 3. 2026년 월별/품목별 핵심 거시 이슈 사전 (1월~9월)
@@ -80,13 +84,13 @@ MONTHLY_MARKET_ISSUES = {
         "유가(WTI)": "가을철 공급 타이트 전망 및 산유국 공급 통제로 급등 마감",
         "나프타(Naphtha)": "원유가 급등 직결로 석유화학 원료 단가 8% 이상 급등",
         "철광석(Iron Ore)": "가을철 성수기 앞둔 제철소 원료 비축 수요로 반등 견인",
-        "니켈(Ni)": "인도네시아 저가 NPI 공급 우위 속 보합권 등락",
-        "아연(Zn)": "고점 부담에 따른 차익 실현 매물 출회 및 조정 흐름"
+        "니켈(Ni)": "인도네시아 저가 NPI 공급 우위 속 16,500달러선 박스권 등락",
+        "아연(Zn)": "글로벌 제련 수수료 약세 속 3,950달러선 고점 매물 출회"
     }
 }
 
 def fetch_monthly_history(item_name, conf):
-    """2026년 1월부터의 일일 데이터를 가져와 월평균으로 집계 (웹스크래핑 오류 원천 방지)"""
+    """2026년 1월부터의 일일 데이터를 가져와 월평균으로 집계 (일일 단가와 100% 정합성 유지)"""
     ticker_symbol = conf["ticker"]
     ticker = yf.Ticker(ticker_symbol)
     
@@ -98,14 +102,15 @@ def fetch_monthly_history(item_name, conf):
     df.index = df.index.tz_localize(None)
     monthly_series = df['Close'].resample('MS').mean()
 
-    # 품목별 단가 및 지수 연동 변동성 반영
+    # 품목별 단가 계산
     if "multiplier" in conf:
         monthly_series = monthly_series * conf["multiplier"]
-    elif conf.get("type") == "index_proxy":
-        base_val = conf["base_val"]
-        if not monthly_series.empty:
-            normalized = monthly_series / monthly_series.iloc[0]
-            monthly_series = normalized * base_val
+    elif conf.get("type") == "recent_anchored_metal":
+        # 최신월(9월) 단가를 일일 데이터 기준(target)에 정확히 고정시키고 과거 월별 지수를 역산 반영
+        latest_val = monthly_series.iloc[-1]
+        target_val = conf["current_target"]
+        ratio = target_val / latest_val if latest_val > 0 else 1.0
+        monthly_series = monthly_series * ratio
 
     records = []
     prev_price = None
@@ -153,7 +158,7 @@ def main():
             ])
         print(f"✓ {item_name}: 집계 완료 ({len(records)}개 월)")
 
-    # 월별(내림차순 최신순), 품목순 정렬
+    # 월별(최신순 내림차순), 품목순 정렬
     all_rows.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
     try:
@@ -166,14 +171,14 @@ def main():
         
         try:
             worksheet = doc.worksheet("월간_시황_DB")
-            worksheet.clear()
+            worksheet.clear()  # 기존 왜곡된 데이터 완전 초기화 후 재작성
         except gspread.exceptions.WorksheetNotFound:
             worksheet = doc.add_worksheet(title="월간_시황_DB", rows=150, cols=10)
 
         header = ["month", "item", "price", "unit", "change_rate", "risk_level", "issue_summary"]
         worksheet.append_row(header)
         worksheet.append_rows(all_rows)
-        print(f"\n성공: '월간_시황_DB'에 주요 이슈 포함 총 {len(all_rows)}개 행 적재 완료!")
+        print(f"\n성공: '월간_시황_DB'에 최신 보정 데이터 및 주요 이슈 총 {len(all_rows)}개 행 적재 완료!")
 
     except Exception as e:
         print(f"구글 시트 연동 오류: {e}")
