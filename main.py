@@ -19,7 +19,6 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # 2. 품목별 실제 데이터 소스 매핑
-# - 해외 IP 차단 및 웹 크롤링 오류를 방지하기 위해 비철금속(니켈, 아연)을 글로벌 금속 선물 변동률과 직접 연동
 ITEMS_CONFIG = {
     "유가(WTI)": {
         "source": "yfinance",
@@ -31,7 +30,7 @@ ITEMS_CONFIG = {
         "source": "naphtha_calc",
         "ticker": "BZ=F",
         "unit": "USD/ton",
-        "search_query": "나프타 시황 석유화학"
+        "search_query": "나프타 석유화학 NCC"
     },
     "니켈(Ni)": {
         "source": "metal_proxy",
@@ -91,11 +90,7 @@ def get_naphtha_price():
     return 800.0, "+0.00%"
 
 def get_metal_price_by_proxy(conf):
-    """
-    비철금속(니켈, 아연) 일일 시세 산출:
-    웹 크롤링의 403 차단 및 태그 불일치 오류를 방지하고, 
-    글로벌 금속 대표 지표(구리선물 등)의 일일 변동률(%)을 기준가에 동적 연동하여 산출
-    """
+    """비철금속(니켈, 아연) 일일 시세 산출"""
     try:
         ticker = yf.Ticker(conf["ticker"])
         hist = ticker.history(period="5d")
@@ -103,8 +98,6 @@ def get_metal_price_by_proxy(conf):
             current_idx = hist['Close'].iloc[-1]
             prev_idx = hist['Close'].iloc[-2]
             pct_change = ((current_idx - prev_idx) / prev_idx) * 100
-            
-            # 기준 가격에 금일 변동률을 실시간 적용
             calc_price = round(conf["base_val"] * (1 + (pct_change / 100)), 2)
             return calc_price, f"{pct_change:+.2f}%"
     except Exception as e:
@@ -127,59 +120,64 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def analyze_news_with_gemini(item_name, query, price_str, change_str):
-    """뉴스 수집 및 Gemini 요약 (표준 모델 및 동적 Fallback 적용)"""
-    encoded_query = quote(query)
+    """최신 2일 이내 기사 필터링 및 Gemini 기반 당일 핵심 시황 요약"""
+    # 1. 과거 기사 반복 노출 차단을 위한 최신 기간 필터(when:2d) 적용
+    query_with_time = f"{query} when:2d"
+    encoded_query = quote(query_with_time)
     rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     feed = feedparser.parse(rss_url)
     
-    titles = [entry.title for entry in feed.entries[:4] if hasattr(entry, 'title')]
-    news_context = " / ".join(titles) if titles else ""
+    # 2일 이내 뉴스가 부족할 경우 일반 검색으로 1회 폴백
+    if not feed.entries:
+        rss_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=ko&gl=KR&ceid=KR:ko"
+        feed = feedparser.parse(rss_url)
+
+    titles = [entry.title for entry in feed.entries[:3] if hasattr(entry, 'title')]
+    news_context = " / ".join(titles) if titles else "금일 주요 긴급 속보 없음 (글로벌 장세 관망)"
 
     # 방향성 도출
     try:
         clean_rate = float(change_str.replace('%', '').replace('+', '').strip())
-        direction_text = "상승 마감" if clean_rate > 0 else ("하락 마감" if clean_rate < 0 else "보합")
+        direction_text = "상승 마감" if clean_rate > 0.05 else ("하락 마감" if clean_rate < -0.05 else "보합")
     except Exception:
         direction_text = "보합"
 
     # Gemini 호출 시도
     if GEMINI_API_KEY:
-        for model_name in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
+        for model_name in ["gemini-2.5-flash", "gemini-1.5-flash"]:
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
-당신은 원자재 구매 전문가입니다.
-금일 {item_name} 시세는 [{price_str}, 전일대비 {change_str} {direction_text}]입니다.
-관련 뉴스 헤드라인:
-{news_context if news_context else "관련 긴급 속보 없음, 글로벌 시장 수급 관망"}
+당신은 원자재 수급/구매 분석 전문가입니다.
+금일 {item_name}의 단가는 [{price_str}], 전일대비 변동률은 [{change_str}]로 [{direction_text}]했습니다.
+
+[수집된 시장 뉴스]:
+{news_context}
 
 [작성 지침]:
-- 위 뉴스 헤드라인을 바탕으로 금일 {direction_text}의 핵심 원인을 1문장(50~70자)으로 요약하세요.
-- 금일 방향({direction_text})과 모순되는 과거 기사 내용은 철저히 배제하세요.
-- 기사가 부족하더라도 당일 등락폭({change_str})과 해당 원자재의 일반적 수급 요인(지정학, 생산/재고 변동 등)을 반영해 구체적으로 서술하세요.
-- 불필요한 인사말 없이 오직 "시황 요약: [내용]" 형식으로만 출력하세요.
+1. 당일 등락 방향({direction_text}) 및 변동폭({change_str})에 맞춰, 가격 변동의 실질적인 거시/수급 요인을 간결히 분석하세요.
+2. 기사 제목을 그대로 나열하거나 복사하지 말고, 완전한 문장으로 요약하세요.
+3. 기사가 부족할 경우 해당 원자재의 일반적 시장 요인(산유국 감산, 제련 수수료, 재고 변동, 인프라 수요 등)을 바탕으로 작성하세요.
+4. 반드시 "시황 요약: [40~60자 내외의 핵심 내용] 영향으로 {direction_text}" 형식으로만 출력하세요.
 """
                 res = m.generate_content(prompt).text.strip().replace("\n", " ")
                 if res:
-                    return res if res.startswith("시황 요약:") else f"시황 요약: {res}"
+                    clean_res = res.replace("*", "").strip()
+                    return clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
             except Exception as e:
-                print(f"[{item_name}] Gemini({model_name}) 호출 실패: {e}")
+                print(f"[{item_name}] Gemini({model_name}) 호출 오류: {e}")
                 continue
 
-    # Fallback 1: 뉴스 헤드라인 기반 문구 생성
-    if titles:
-        clean_headline = titles[0].split(" - ")[0] if " - " in titles[0] else titles[0]
-        return f"시황 요약: {clean_headline[:45]} 등 영향으로 {direction_text}"
-
-    # Fallback 2: 품목별 기본 문구
-    fallback_reasons = {
-        "유가(WTI)": f"OPEC+ 감산 기조 및 지정학적 리스크 영향으로 {direction_text}",
-        "나프타(Naphtha)": f"원유가 변동 및 아시아 석유화학 수급 영향으로 {direction_text}",
-        "니켈(Ni)": f"LME 재고 변동 및 스테인리스/배터리 수요 영향으로 {direction_text}",
-        "아연(Zn)": f"글로벌 제련소 가동률 및 인프라 도금재 수요 변동으로 {direction_text}",
-        "철광석(Iron Ore)": f"중국 제철소 가동률 및 부동산 인프라 수요 전망에 따라 {direction_text}"
+    # Fallback: 뉴스 파싱 또는 API 오류 시 기사 제목 단순 복사 대신 시장 팩터 기반 동적 문구 생성
+    market_drivers = {
+        "유가(WTI)": "산유국 공급 통제 및 글로벌 원유 재고 추이",
+        "나프타(Naphtha)": "원유가 등락 연동 및 아시아 석화 설비 원가 부담",
+        "니켈(Ni)": "인도네시아 NPI 공급 흐름 및 배터리/STS 수요 관망",
+        "아연(Zn)": "글로벌 제련 수수료(TC) 변동 및 도금재 출하 동향",
+        "철광석(Iron Ore)": "중국 제철소 가동률 및 주요 항만 재고 증감"
     }
-    return f"시황 요약: {fallback_reasons.get(item_name, f'글로벌 수급 변동성 속 {direction_text}')}"
+    driver = market_drivers.get(item_name, "글로벌 원자재 수급 및 시장 변동성")
+    return f"시황 요약: {driver} 영향으로 {direction_text}"
 
 def main():
     kst = timezone(timedelta(hours=9))
