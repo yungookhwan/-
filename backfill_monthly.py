@@ -5,14 +5,9 @@ import pandas as pd
 import yfinance as yf
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import google.generativeai as genai
 
-# 1. API 키 및 서비스 계정 환경변수 로드
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# 1. 인증키 로드
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 # 2. 품목별 티커 및 설정 (일일 main.py와 100% 동기화)
 TICKERS_CONFIG = {
@@ -45,7 +40,7 @@ TICKERS_CONFIG = {
     }
 }
 
-# 3. 2026년 월별/품목별 핵심 거시 이슈 사전 (1월~9월 기본값)
+# 3. 2026년 월별/품목별 핵심 거시 이슈 사전 (1월~9월 확정본)
 MONTHLY_MARKET_ISSUES = {
     "2026-01": {
         "유가(WTI)": "OPEC+ 감산 기조 유지 속 연초 난방 수요 안정세",
@@ -112,29 +107,8 @@ MONTHLY_MARKET_ISSUES = {
     }
 }
 
-def generate_monthly_summary_gemini(month_str, item_name, price, change_rate_str, direction_text):
-    """당월(최신월) 이슈에 대해 Gemini를 활용한 고품질 요약 생성 (폴백 포함)"""
-    if GEMINI_API_KEY:
-        for model_name in ["gemini-2.5-flash", "gemini-1.5-flash"]:
-            try:
-                m = genai.GenerativeModel(model_name)
-                prompt = f"""
-당신은 원자재 수급/구매 분석 전문가입니다.
-{month_str} 월간 {item_name}의 평균 단가는 [{price}], 전월 대비 변동률은 [{change_rate_str}]로 [{direction_text}]했습니다.
-
-[작성 지침]:
-1. 원자재 시장의 대표적인 거시 요인(OPEC+ 정책, 중국 제철/인프라 수요, 제련 수수료, 인도네시아 NPI 공급, 석유화학 마진 등)을 반영하세요.
-2. 구매 보고서에 적합하도록 정중하고 객관적인 1문장(50자 내외)으로 작성하세요.
-3. 반드시 "시황 요약: [내용] 영향으로 {direction_text}" 형식으로 작성하세요.
-"""
-                res = m.generate_content(prompt).text.strip().replace("\n", " ").replace("*", "")
-                if res:
-                    return res if res.startswith("시황 요약:") else f"시황 요약: {res}"
-            except Exception as e:
-                print(f"[{item_name}] 월간 Gemini({model_name}) 요약 생성 실패: {e}")
-                continue
-
-    # 폴백 문구
+def get_fallback_summary(item_name, direction_text):
+    """사전 외 월간 데이터 발생 시 품목별 핵심 시장 요인 기반 문구 생성"""
     market_drivers = {
         "유가(WTI)": "산유국 공급 통제 및 글로벌 에너지 재고 변동",
         "나프타(Naphtha)": "원유가 등락 연동 및 역내 석유화학 원료 마진 부담",
@@ -186,12 +160,12 @@ def fetch_monthly_history(item_name, conf):
         risk = "HIGH" if abs_rate >= 3.0 else ("MID" if abs_rate >= 1.0 else "LOW")
         direction_text = "상승 마감" if change_rate_val > 0.05 else ("하락 마감" if change_rate_val < -0.05 else "보합")
 
-        # 사전 정의 이슈 확인 후 미등록 월은 Gemini 동적 생성 적용
+        # 사전 정의 이슈 매핑 (없을 경우 팩터 기반 문구 적용)
         if month_str in MONTHLY_MARKET_ISSUES and item_name in MONTHLY_MARKET_ISSUES[month_str]:
             raw_summary = MONTHLY_MARKET_ISSUES[month_str][item_name]
             summary_issue = f"시황 요약: {raw_summary}" if not raw_summary.startswith("시황 요약:") else raw_summary
         else:
-            summary_issue = generate_monthly_summary_gemini(month_str, item_name, rounded_price, change_rate_str, direction_text)
+            summary_issue = get_fallback_summary(item_name, direction_text)
 
         records.append({
             "month": month_str,
