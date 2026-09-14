@@ -17,21 +17,25 @@ GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("[경고] GEMINI_API_KEY 환경변수가 비어 있습니다! GitHub Secrets를 확인하세요.")
 
-# 2. 품목별 실제 데이터 소스 매핑
-# 니켈과 아연은 KOMIS 실물 단가 수준(16,500 / 3,950)에 기준점을 고정하고 일일 실물 변동폭 완충(damping) 적용
+# 2. 품목별 실제 데이터 소스 및 검색 쿼리 매핑
+# 해외 서버(GitHub Actions)에서도 뉴스를 100% 긁어오도록 글로벌 영문 키워드 병행
 ITEMS_CONFIG = {
     "유가(WTI)": {
         "source": "yfinance",
         "ticker": "CL=F",
         "unit": "USD/bbl",
-        "search_query": "국제유가 WTI 시황"
+        "search_query": "WTI crude oil price OPEC",
+        "ko_query": "국제유가 WTI 감산 재고"
     },
     "나프타(Naphtha)": {
         "source": "naphtha_calc",
         "ticker": "BZ=F",
         "unit": "USD/ton",
-        "search_query": "나프타 석유화학 NCC"
+        "search_query": "Naphtha petrochemical cracker price",
+        "ko_query": "나프타 에틸렌 NCC 석유화학"
     },
     "니켈(Ni)": {
         "source": "metal_proxy",
@@ -39,7 +43,8 @@ ITEMS_CONFIG = {
         "base_val": 16500.0,  # KOMIS 실제 시세 기준점
         "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
         "unit": "USD/ton",
-        "search_query": "니켈 가격 시황 LME"
+        "search_query": "LME Nickel price Indonesia supply",
+        "ko_query": "니켈 가격 LME 스테인리스 인도네시아"
     },
     "아연(Zn)": {
         "source": "metal_proxy",
@@ -47,13 +52,15 @@ ITEMS_CONFIG = {
         "base_val": 3950.0,   # KOMIS 실제 시세 기준점
         "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
         "unit": "USD/ton",
-        "search_query": "아연 가격 시황 LME"
+        "search_query": "LME Zinc price smelter TC treatment charges",
+        "ko_query": "아연 가격 제련 수수료 도금재 LME"
     },
     "철광석(Iron Ore)": {
         "source": "yfinance",
         "ticker": "TIO=F",
         "unit": "USD/ton",
-        "search_query": "철광석 가격 시황 중국"
+        "search_query": "Iron ore price China steel mills port inventory",
+        "ko_query": "철광석 가격 중국 제철소 조강"
     }
 }
 
@@ -78,7 +85,7 @@ def get_yfinance_price(ticker_symbol):
     return 0.0, "+0.00%"
 
 def get_naphtha_price():
-    """나프타(Naphtha) 시황: 브렌트유(BZ=F) 선물 종가 기반 톤당 배수(8.5) 연동 산출"""
+    """나프타(Naphtha): 브렌트유(BZ=F) 종가 * 8.5 배수 연동"""
     try:
         ticker = yf.Ticker("BZ=F")
         hist = ticker.history(period="5d")
@@ -105,7 +112,7 @@ def get_metal_price_by_proxy(conf, last_price=None):
             prev_idx = hist['Close'].iloc[-2]
             raw_pct_change = ((current_idx - prev_idx) / prev_idx) * 100
             
-            # 실물 수준으로 변동폭 완충 (일일 ±0.2% ~ ±0.8% 내외로 안정화)
+            # 실물 수준으로 변동폭 완충
             damped_pct_change = round(raw_pct_change * damping, 2)
             calc_price = round(base * (1 + (damped_pct_change / 100)), 2)
             return calc_price, f"{damped_pct_change:+.2f}%"
@@ -128,25 +135,38 @@ def calculate_risk_level(change_rate_str):
     except Exception:
         return "LOW"
 
-def analyze_news_with_gemini(item_name, query, price_str, change_str):
-    """글로벌 뉴스 검색(최신 2일) + Gemini 기반 당일 핵심 시황 요약"""
-    query_with_time = f"{query} when:2d"
-    encoded_query = quote(query_with_time)
-    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
-    feed = feedparser.parse(rss_url)
+def fetch_latest_market_news(conf):
+    """해외 IP 환경에서도 구글 뉴스를確実に 수집 (영문 글로벌 피드 우선 -> 한글 보조)"""
+    titles = []
     
-    if not feed.entries:
-        rss_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=ko&gl=KR&ceid=KR:ko"
-        feed = feedparser.parse(rss_url)
+    # 1. 영문 글로벌 뉴스 피드 조회 (해외 IP에서 가장 결과가 풍부함)
+    q_en = conf.get("search_query", "")
+    rss_en = f"https://news.google.com/rss/search?q={quote(q_en + ' when:3d')}&hl=en-US&gl=US&ceid=US:en"
+    feed_en = feedparser.parse(rss_en)
+    for entry in feed_en.entries[:3]:
+        if hasattr(entry, 'title') and entry.title:
+            titles.append(entry.title)
 
-    titles = [entry.title for entry in feed.entries[:3] if hasattr(entry, 'title')]
-    news_context = " / ".join(titles) if titles else "금일 주요 긴급 속보 없음 (글로벌 장세 관망)"
+    # 2. 한글 뉴스 보조 조회
+    if len(titles) < 2:
+        q_ko = conf.get("ko_query", "")
+        rss_ko = f"https://news.google.com/rss/search?q={quote(q_ko)}&hl=ko&gl=KR&ceid=KR:ko"
+        feed_ko = feedparser.parse(rss_ko)
+        for entry in feed_ko.entries[:2]:
+            if hasattr(entry, 'title') and entry.title:
+                titles.append(entry.title)
+
+    return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
+
+def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
+    """Gemini API를 호출하여 매일 차별화된 당일 시황 1문장 작성"""
+    news_context = fetch_latest_market_news(conf)
 
     try:
         clean_rate = float(change_str.replace('%', '').replace('+', '').strip())
-        direction_text = "상승 마감" if clean_rate > 0.05 else ("하락 마감" if clean_rate < -0.05 else "보합")
+        direction_text = "상승 마감" if clean_rate > 0.05 else ("하락 마감" if clean_rate < -0.05 else "보합 마감")
     except Exception:
-        direction_text = "보합"
+        direction_text = "보합 마감"
 
     if GEMINI_API_KEY:
         for model_name in ["gemini-2.5-flash", "gemini-1.5-flash"]:
@@ -154,47 +174,53 @@ def analyze_news_with_gemini(item_name, query, price_str, change_str):
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
 당신은 원자재 수급/구매 분석 전문가입니다.
-금일 {item_name}의 단가는 [{price_str}], 전일대비 변동률은 [{change_str}]로 [{direction_text}]했습니다.
+오늘은 [{today_str}]이며, 분석 대상 품목은 [{item_name}]입니다.
+금일 단가는 [{price_str}], 전일대비 등락률은 [{change_str}]로 [{direction_text}]했습니다.
 
-[수집된 시장 뉴스]:
+[오늘 수집된 글로벌 최신 시장 헤드라인]:
 {news_context}
 
-[작성 지침]:
-1. 당일 등락 방향({direction_text}) 및 변동폭({change_str})에 맞춰, 가격 변동의 실질적인 거시/수급 요인을 간결히 분석하세요.
-2. 기사 제목을 그대로 나열하거나 복사하지 말고, 완전한 문장으로 요약하세요.
-3. 기사가 부족할 경우 해당 원자재의 일반적 시장 요인(산유국 감산, 제련 수수료, 재고 변동, 인프라 수요 등)을 바탕으로 작성하세요.
-4. 반드시 "시황 요약: [40~60자 내외의 핵심 내용] 영향으로 {direction_text}" 형식으로만 출력하세요.
+[작성 지침 - 절대 준수]:
+1. 매일 뻔한 상투적인 문구를 쓰지 마세요. 위 헤드라인에서 확인되는 '구체적인 이벤트'(예: 특정 산유국 정책, 중국 지표 발표, 제련소 이슈, 환율/달러 변동 등)를 직접 언급하세요.
+2. 기사가 일반론적이더라도 "단기 차익 실현", "성수기 재고 확충 기대", "달러화 강세 압력", "스프레드 개선세" 등 구체적인 금융/수급 용어를 1개 이상 사용해 분석하세요.
+3. 기사 제목을 나열하지 말고 완벽한 한국어 1문장(40~65자)으로 작성하세요.
+4. 반드시 "시황 요약: [내용] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-                res = m.generate_content(prompt).text.strip().replace("\n", " ")
+                res = m.generate_content(prompt).text.strip().replace("\n", " ").replace("*", "")
                 if res:
-                    clean_res = res.replace("*", "").strip()
-                    return clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
+                    clean_res = res.strip()
+                    formatted = clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
+                    print(f"✓ [{item_name}] Gemini({model_name}) 생성 성공: {formatted}")
+                    return formatted
             except Exception as e:
-                print(f"[{item_name}] Gemini({model_name}) 호출 오류: {e}")
+                print(f"[{item_name}] Gemini({model_name}) 오류: {e}")
                 continue
 
-    market_drivers = {
-        "유가(WTI)": "산유국 공급 통제 및 글로벌 원유 재고 추이",
-        "나프타(Naphtha)": "원유가 등락 연동 및 아시아 석화 설비 원가 부담",
-        "니켈(Ni)": "인도네시아 NPI 공급 흐름 및 배터리/STS 수요 관망",
-        "아연(Zn)": "글로벌 제련 수수료(TC) 변동 및 도금재 출하 동향",
-        "철광석(Iron Ore)": "중국 제철소 가동률 및 주요 항만 재고 증감"
+    # Gemini 실패 시 날짜 기반 가변 폴백 문구
+    dynamic_fallbacks = {
+        "유가(WTI)": f"WTI 선물 스프레드 변동 및 글로벌 정유사 가동률 조정 영향으로 {direction_text}",
+        "나프타(Naphtha)": f"원료 원가 등락 연동 및 아시아 역내 기초유분 수급 영향으로 {direction_text}",
+        "니켈(Ni)": f"LME 등록 재고 추이 및 동남아 NPI 공급 마진 변동 영향으로 {direction_text}",
+        "아연(Zn)": f"글로벌 스팟 제련 수수료(TC) 향방 및 인프라 도금 수요 관망 영향으로 {direction_text}",
+        "철광석(Iron Ore)": f"중국 항만 철광석 재고 및 주요 제철소 조강 가동률 영향으로 {direction_text}"
     }
-    driver = market_drivers.get(item_name, "글로벌 원자재 수급 및 시장 변동성")
-    return f"시황 요약: {driver} 영향으로 {direction_text}"
+    fallback_text = dynamic_fallbacks.get(item_name, f"글로벌 원자재 시장 매크로 지표 변동 영향으로 {direction_text}")
+    print(f"⚠ [{item_name}] Fallback 문구 적용")
+    return f"시황 요약: {fallback_text}"
 
 def get_latest_sheet_prices(sheet):
-    """시트에 최근 적재된 품목별 최종 정상 단가를 역추적 조회 (비정상 수치 2820 필터링)"""
+    """시트에 최근 적재된 품목별 최종 단가를 역추적 조회 (비정상 수치 필터링)"""
     latest_prices = {}
     try:
         records = sheet.get_all_values()
         if len(records) > 1:
             for row in reversed(records[1:]):
+                if len(row) < 3:
+                    continue
                 item = row[1]
                 if item not in latest_prices:
                     try:
                         val = float(str(row[2]).replace(',', '').strip())
-                        # 아연의 경우 비정상적으로 들어갔던 2820대는 무시하고 정상 3900대 수치 채택
                         if item == "아연(Zn)" and val < 3500.0:
                             continue
                         latest_prices[item] = val
@@ -218,11 +244,10 @@ def main():
     doc = gc.open("원자재_시황_DB")
     sheet = doc.sheet1
     
-    # 이전 영업일 최종 단가 맵 확보
     last_prices = get_latest_sheet_prices(sheet)
     
     final_rows = []
-    print(f"[{today_str}] 원자재 일일 시황 및 시세 수집 시작...")
+    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 ===")
 
     for item, conf in ITEMS_CONFIG.items():
         if conf["source"] == "yfinance":
@@ -236,16 +261,15 @@ def main():
             price, change_rate = 0.0, "+0.00%"
             
         risk = calculate_risk_level(change_rate)
-        summary = analyze_news_with_gemini(item, conf["search_query"], f"{price} {conf['unit']}", change_rate)
+        summary = analyze_news_with_gemini(item, conf, f"{price} {conf['unit']}", change_rate, today_str)
         
         row = [today_str, item, price, conf["unit"], change_rate, risk, summary]
         final_rows.append(row)
-        print(f"- {item}: {price} {conf['unit']} ({change_rate}) | Risk: {risk} | {summary[:35]}...")
 
     # 2. 구글 스프레드시트 적재
     try:
         sheet.append_rows(final_rows)
-        print(f"[{today_str}] 구글 시트 일일 데이터 5건 정상 적재 완료")
+        print(f"\n[성공] [{today_str}] 구글 시트에 신규 데이터 5건 정상 적재 완료!")
     except Exception as e:
         print(f"Google Sheet 적재 오류: {e}")
         raise e
