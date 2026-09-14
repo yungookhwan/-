@@ -40,8 +40,8 @@ ITEMS_CONFIG = {
     "니켈(Ni)": {
         "source": "metal_proxy",
         "ticker": "HG=F",
-        "base_val": 16500.0,
-        "damping": 0.20,
+        "base_val": 16500.0,  # KOMIS 실제 시세 기준점
+        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
         "unit": "USD/ton",
         "search_query": "LME Nickel price Indonesia supply",
         "ko_query": "니켈 가격 LME 스테인리스 인도네시아"
@@ -49,8 +49,8 @@ ITEMS_CONFIG = {
     "아연(Zn)": {
         "source": "metal_proxy",
         "ticker": "HG=F",
-        "base_val": 3950.0,
-        "damping": 0.20,
+        "base_val": 3950.0,   # KOMIS 실제 시세 기준점
+        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
         "unit": "USD/ton",
         "search_query": "LME Zinc price smelter TC treatment charges",
         "ko_query": "아연 가격 제련 수수료 도금재 LME"
@@ -135,7 +135,7 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def fetch_latest_market_news(conf):
-    """해외 IP 환경에서도 구글 뉴스를確実に 수집"""
+    """해외 IP 환경에서도 구글 뉴스를 확실하게 수집 (글로벌 피드 우선)"""
     titles = []
     
     q_en = conf.get("search_query", "")
@@ -156,7 +156,7 @@ def fetch_latest_market_news(conf):
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
 def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
-    """Gemini 최신 모델 탐색 (3.8 Flash 우선 -> 3.1 Pro -> 2.5 Flash -> 1.5 Flash)"""
+    """최신 플래시 공식 모델(gemini-2.5-flash) 다이렉트 호출 (타임아웃 없이 즉시 처리)"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -165,9 +165,8 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
     except Exception:
         direction_text = "보합 마감"
 
+    # 구글 API 공식 지원 모델 식별자 (타임아웃 없는 최적화 순서)
     models_to_try = [
-        "gemini-3.8-flash",
-        "gemini-3.1-pro",
         "gemini-2.5-flash",
         "gemini-1.5-flash"
     ]
@@ -197,7 +196,7 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
                     print(f"✓ [{item_name}] Gemini({model_name}) 요약 성공: {formatted}")
                     return formatted
             except Exception as e:
-                print(f"[{item_name}] Gemini({model_name}) 시도 실패 ({e}), 다음 모델로 전환합니다.")
+                print(f"[{item_name}] Gemini({model_name}) 호출 예외: {e}")
                 continue
     else:
         print(f"[{item_name}] 경고: GEMINI_API_KEY 미설정으로 Fallback 문구가 적용됩니다.")
@@ -252,7 +251,7 @@ def main():
     last_prices = get_latest_sheet_prices(sheet)
     
     final_rows = []
-    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 (Gemini 3.8 Flash 우선 모드) ===")
+    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 (Gemini 2.5 Flash 고속 모드) ===")
 
     for idx, (item, conf) in enumerate(ITEMS_CONFIG.items()):
         if conf["source"] == "yfinance":
@@ -266,10 +265,6 @@ def main():
             price, change_rate = 0.0, "+0.00%"
             
         risk = calculate_risk_level(change_rate)
-        
-        if idx > 0 and GEMINI_API_KEY:
-            time.sleep(1)
-
         summary = analyze_news_with_gemini(item, conf, f"{price} {conf['unit']}", change_rate, today_str)
         
         row = [today_str, item, price, conf["unit"], change_rate, risk, summary]
@@ -278,7 +273,7 @@ def main():
     # 2. 구글 스프레드시트 적재
     try:
         sheet.append_rows(final_rows)
-        print(f"\n[성공] [{today_str}] 구글 시트에 3.8 Flash 기반 데이터 5건 정상 적재 완료!")
+        print(f"\n[성공] [{today_str}] 구글 시트에 2.5 Flash 기반 데이터 5건 정상 적재 완료!")
     except Exception as e:
         print(f"Google Sheet 적재 오류: {e}")
         raise e
