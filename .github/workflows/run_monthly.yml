@@ -18,12 +18,14 @@ jobs:
         with:
           python-version: '3.11'
 
+      # requirements.txt에 등록된 모든 패키지를 확실하게 설치하도록 변경
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas yfinance requests beautifulsoup4 gspread oauth2client
+          pip install -r requirements.txt pandas
 
       - name: Run Monthly Backfill Script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}  # Gemini API 키 추가
         run: python backfill_monthly.py
