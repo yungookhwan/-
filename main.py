@@ -40,8 +40,8 @@ ITEMS_CONFIG = {
     "니켈(Ni)": {
         "source": "metal_proxy",
         "ticker": "HG=F",
-        "base_val": 16500.0,  # KOMIS 실제 시세 기준점
-        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
+        "base_val": 16500.0,
+        "damping": 0.20,
         "unit": "USD/ton",
         "search_query": "LME Nickel price Indonesia supply",
         "ko_query": "니켈 가격 LME 스테인리스 인도네시아"
@@ -49,8 +49,8 @@ ITEMS_CONFIG = {
     "아연(Zn)": {
         "source": "metal_proxy",
         "ticker": "HG=F",
-        "base_val": 3950.0,   # KOMIS 실제 시세 기준점
-        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
+        "base_val": 3950.0,
+        "damping": 0.20,
         "unit": "USD/ton",
         "search_query": "LME Zinc price smelter TC treatment charges",
         "ko_query": "아연 가격 제련 수수료 도금재 LME"
@@ -135,7 +135,7 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def fetch_latest_market_news(conf):
-    """해외 IP 환경에서도 구글 뉴스를 확실하게 수집 (글로벌 피드 우선)"""
+    """실제 시장 이슈 수집 (글로벌 피드 우선 -> 한글 피드 보조)"""
     titles = []
     
     q_en = conf.get("search_query", "")
@@ -156,7 +156,7 @@ def fetch_latest_market_news(conf):
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
 def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
-    """최신 플래시 공식 모델(gemini-2.5-flash) 다이렉트 호출 (타임아웃 없이 즉시 처리)"""
+    """실제 뉴스 헤드라인 기반 심층 분석 (1.5-pro -> 1.5-flash 순차 호출)"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -165,9 +165,9 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
     except Exception:
         direction_text = "보합 마감"
 
-    # 구글 API 공식 지원 모델 식별자 (타임아웃 없는 최적화 순서)
+    # 타임아웃 오류 없이 안정적으로 실제 뉴스 분석을 뽑아내는 모델 체인
     models_to_try = [
-        "gemini-2.5-flash",
+        "gemini-1.5-pro",
         "gemini-1.5-flash"
     ]
 
@@ -184,19 +184,19 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
 {news_context}
 
 [작성 지침]:
-1. 매일 반복되는 판에 박힌 문구를 쓰지 마세요. 헤드라인의 실제 글로벌 이슈(산유국 정책, 중국 경제 지표, 제련소 가동률, 달러 인덱스 등)를 반영하세요.
-2. 기사 내용이 모호하더라도 "스프레드 변동", "기술적 반등", "비축 수요", "단기 차익 실현" 등 구체적인 금융·구매 실무 용어를 1개 이상 사용하여 인과관계를 설명하세요.
-3. 기사 제목을 나열하지 말고 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
-4. 반드시 "시황 요약: [내용] 영향으로 {direction_text}" 형식으로만 답변하세요.
+1. 매일 반복되는 판에 박힌 문구를 쓰지 마세요. 헤드라인의 실제 글로벌 이슈(산유국 정책, 분쟁, 공급 쇼크, 제련소 이슈, 차익 실현 등)를 명확히 반영하세요.
+2. 구체적인 금융/구매 실무 용어(비축 수요 유입, 차익 실현 매물 출회, 제련 수수료 변동, 롤마진 압박 등)를 사용하여 인과관계를 설명하세요.
+3. 기사 제목을 단순 나열하지 말고, 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
+4. 반드시 "시황 요약: [구체적 이슈 및 수급 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
                 res = m.generate_content(prompt).text.strip().replace("\n", " ").replace("*", "")
                 if res:
                     clean_res = res.strip()
                     formatted = clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
-                    print(f"✓ [{item_name}] Gemini({model_name}) 요약 성공: {formatted}")
+                    print(f"✓ [{item_name}] Gemini({model_name}) 심층 분석 완료: {formatted}")
                     return formatted
             except Exception as e:
-                print(f"[{item_name}] Gemini({model_name}) 호출 예외: {e}")
+                print(f"[{item_name}] Gemini({model_name}) 예외 ({e}), 다음 모델로 전환")
                 continue
     else:
         print(f"[{item_name}] 경고: GEMINI_API_KEY 미설정으로 Fallback 문구가 적용됩니다.")
@@ -251,7 +251,7 @@ def main():
     last_prices = get_latest_sheet_prices(sheet)
     
     final_rows = []
-    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 (Gemini 2.5 Flash 고속 모드) ===")
+    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 ===")
 
     for idx, (item, conf) in enumerate(ITEMS_CONFIG.items()):
         if conf["source"] == "yfinance":
@@ -265,6 +265,11 @@ def main():
             price, change_rate = 0.0, "+0.00%"
             
         risk = calculate_risk_level(change_rate)
+        
+        # 품목 간 1초 간격으로 안정적 API 호출
+        if idx > 0 and GEMINI_API_KEY:
+            time.sleep(1)
+
         summary = analyze_news_with_gemini(item, conf, f"{price} {conf['unit']}", change_rate, today_str)
         
         row = [today_str, item, price, conf["unit"], change_rate, risk, summary]
@@ -273,7 +278,7 @@ def main():
     # 2. 구글 스프레드시트 적재
     try:
         sheet.append_rows(final_rows)
-        print(f"\n[성공] [{today_str}] 구글 시트에 2.5 Flash 기반 데이터 5건 정상 적재 완료!")
+        print(f"\n[성공] [{today_str}] 구글 시트에 실제 뉴스 기반 시황 데이터 5건 적재 완료!")
     except Exception as e:
         print(f"Google Sheet 적재 오류: {e}")
         raise e
