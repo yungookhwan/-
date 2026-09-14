@@ -40,8 +40,8 @@ ITEMS_CONFIG = {
     "니켈(Ni)": {
         "source": "metal_proxy",
         "ticker": "HG=F",
-        "base_val": 16500.0,
-        "damping": 0.20,
+        "base_val": 16500.0,  # KOMIS 실제 시세 기준점
+        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
         "unit": "USD/ton",
         "search_query": "LME Nickel price Indonesia supply",
         "ko_query": "니켈 가격 LME 스테인리스 인도네시아"
@@ -49,8 +49,8 @@ ITEMS_CONFIG = {
     "아연(Zn)": {
         "source": "metal_proxy",
         "ticker": "HG=F",
-        "base_val": 3950.0,
-        "damping": 0.20,
+        "base_val": 3950.0,   # KOMIS 실제 시세 기준점
+        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
         "unit": "USD/ton",
         "search_query": "LME Zinc price smelter TC treatment charges",
         "ko_query": "아연 가격 제련 수수료 도금재 LME"
@@ -135,13 +135,13 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def fetch_latest_market_news(conf):
-    """실제 시장 이슈 수집 (글로벌 피드 우선 -> 한글 피드 보조)"""
+    """글로벌 실제 뉴스 헤드라인 수집 (외신 영문 피드 우선)"""
     titles = []
     
     q_en = conf.get("search_query", "")
     rss_en = f"https://news.google.com/rss/search?q={quote(q_en + ' when:3d')}&hl=en-US&gl=US&ceid=US:en"
     feed_en = feedparser.parse(rss_en)
-    for entry in feed_en.entries[:3]:
+    for entry in feed_en.entries[:4]:
         if hasattr(entry, 'title') and entry.title:
             titles.append(entry.title)
 
@@ -156,7 +156,7 @@ def fetch_latest_market_news(conf):
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
 def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
-    """실제 뉴스 헤드라인 기반 심층 분석 (1.5-pro -> 1.5-flash 순차 호출)"""
+    """최신 고성능 모델(3.8 Flash / 3.1 Pro / 1.5 Pro) 우선 심층 분석"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -165,8 +165,10 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
     except Exception:
         direction_text = "보합 마감"
 
-    # 타임아웃 오류 없이 안정적으로 실제 뉴스 분석을 뽑아내는 모델 체인
+    # 고버전 우선 탐색 순서
     models_to_try = [
+        "gemini-3.8-flash",
+        "gemini-3.1-pro",
         "gemini-1.5-pro",
         "gemini-1.5-flash"
     ]
@@ -176,27 +178,27 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
-당신은 글로벌 원자재 시장 및 공급망 전문 수석 애널리스트입니다.
+당신은 글로벌 원자재 및 거시 경제 전문 수석 수석 애널리스트입니다.
 오늘은 [{today_str}]이며, 분석 대상 품목은 [{item_name}]입니다.
 금일 단가는 [{price_str}], 전일대비 등락률은 [{change_str}]로 [{direction_text}]했습니다.
 
 [오늘 수집된 글로벌 최신 시장 뉴스 헤드라인]:
 {news_context}
 
-[작성 지침]:
-1. 매일 반복되는 판에 박힌 문구를 쓰지 마세요. 헤드라인의 실제 글로벌 이슈(산유국 정책, 분쟁, 공급 쇼크, 제련소 이슈, 차익 실현 등)를 명확히 반영하세요.
-2. 구체적인 금융/구매 실무 용어(비축 수요 유입, 차익 실현 매물 출회, 제련 수수료 변동, 롤마진 압박 등)를 사용하여 인과관계를 설명하세요.
-3. 기사 제목을 단순 나열하지 말고, 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
-4. 반드시 "시황 요약: [구체적 이슈 및 수급 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
+[작성 지침 - 절대 준수]:
+1. 뻔한 일반론(단순 수급 관망 등)은 엄격히 배제하세요. 수집된 헤드라인에서 확인되는 실제 구체적인 사건(특정 산유국 정책, 공급 쇼크, 제련소 수수료 급락, 롤마진 압박, 차익 실현 등)을 직접 언급하세요.
+2. 금융/구매 전문가 관점에서 인과관계를 명확히 짚어주세요.
+3. 기사 제목을 나열하지 말고 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
+4. 반드시 "시황 요약: [구체적 사건 및 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-                res = m.generate_content(prompt).text.strip().replace("\n", " ").replace("*", "")
+                res = m.generate_content(prompt, request_options={"timeout": 15}).text.strip().replace("\n", " ").replace("*", "")
                 if res:
                     clean_res = res.strip()
                     formatted = clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
-                    print(f"✓ [{item_name}] Gemini({model_name}) 심층 분석 완료: {formatted}")
+                    print(f"✓ [{item_name}] Gemini({model_name}) 심층 시황 생성 성공: {formatted}")
                     return formatted
             except Exception as e:
-                print(f"[{item_name}] Gemini({model_name}) 예외 ({e}), 다음 모델로 전환")
+                print(f"[{item_name}] Gemini({model_name}) 호출 대기/실패 ({e}), 다음 모델로 전환합니다.")
                 continue
     else:
         print(f"[{item_name}] 경고: GEMINI_API_KEY 미설정으로 Fallback 문구가 적용됩니다.")
@@ -251,7 +253,7 @@ def main():
     last_prices = get_latest_sheet_prices(sheet)
     
     final_rows = []
-    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 ===")
+    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 (고버전 Gemini 우선 모드) ===")
 
     for idx, (item, conf) in enumerate(ITEMS_CONFIG.items()):
         if conf["source"] == "yfinance":
@@ -266,9 +268,9 @@ def main():
             
         risk = calculate_risk_level(change_rate)
         
-        # 품목 간 1초 간격으로 안정적 API 호출
+        # 고성능 모델의 Rate Limit 방지를 위한 2초 대기
         if idx > 0 and GEMINI_API_KEY:
-            time.sleep(1)
+            time.sleep(2)
 
         summary = analyze_news_with_gemini(item, conf, f"{price} {conf['unit']}", change_rate, today_str)
         
@@ -278,7 +280,7 @@ def main():
     # 2. 구글 스프레드시트 적재
     try:
         sheet.append_rows(final_rows)
-        print(f"\n[성공] [{today_str}] 구글 시트에 실제 뉴스 기반 시황 데이터 5건 적재 완료!")
+        print(f"\n[성공] [{today_str}] 구글 시트에 실제 뉴스 기반 심층 시황 5건 적재 완료!")
     except Exception as e:
         print(f"Google Sheet 적재 오류: {e}")
         raise e
