@@ -59,8 +59,10 @@ ITEMS_CONFIG = {
     }
 }
 
+from bs4 import BeautifulSoup
+
 def fetch_komis_mail_prices():
-    """KOMIS 뉴스레터 메일 본문에서 실제 LME CASH 니켈·아연 단가/등락률 파싱"""
+    """KOMIS 뉴스레터 메일 본문(HTML Table)에서 실제 LME CASH 니켈·아연 단가/등락률 정확 추출"""
     parsed_prices = {}
     if not GMAIL_USER or not GMAIL_APP_PASS:
         print("[메일 건너뜀] GMAIL_USER 또는 GMAIL_APP_PASS 시크릿 미설정")
@@ -71,11 +73,9 @@ def fetch_komis_mail_prices():
         mail.login(GMAIL_USER, GMAIL_APP_PASS)
         mail.select("inbox")
 
-        # 1. 'komis' 발신 메일 우선 검색
         status, messages = mail.search(None, '(FROM "komis")')
         msg_ids = messages[0].split() if status == "OK" and messages[0] else []
 
-        # 발신자 조건으로 안 잡히면 최근 메일 전체 20건 검사
         if not msg_ids:
             status, all_msgs = mail.search(None, 'ALL')
             if status == "OK" and all_msgs[0]:
@@ -86,18 +86,16 @@ def fetch_komis_mail_prices():
             mail.logout()
             return parsed_prices
 
-        # 최근 메일 15건을 최신순으로 역순 탐색
-        for msg_id in reversed(msg_ids[-15:]):
+        # 최신 메일 10건 탐색
+        for msg_id in reversed(msg_ids[-10:]):
             _, data = mail.fetch(msg_id, "(RFC822)")
             raw_email = data[0][1]
             msg = email.message_from_bytes(raw_email)
 
-            # 메일 제목 디코딩
             subject, encoding = decode_header(msg.get("Subject", ""))[0]
             if isinstance(subject, bytes):
                 subject = subject.decode(encoding or "utf-8", errors="ignore")
 
-            # 본문 추출
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -111,37 +109,48 @@ def fetch_komis_mail_prices():
                 if payload:
                     body = payload.decode("utf-8", errors="ignore")
 
-            # 메일에 '니켈'이나 '아연'이 포함된 경우 탐색
             if "니켈" not in body and "아연" not in body:
                 continue
 
             print(f"🔍 [메일 확인 중] 제목: {subject}")
 
-            # HTML 태그 제거하여 순수 텍스트 정제
-            clean_body = re.sub(r'<[^>]+>', ' ', body)
-            clean_body = re.sub(r'&nbsp;', ' ', clean_body)
+            # BeautifulSoup으로 HTML 테이블 정밀 파싱
+            soup = BeautifulSoup(body, "html.parser")
+            rows = soup.find_all("tr")
 
-            # 패턴 1: 대괄호 표기형 "니켈 [ 16,410] ... ▲ 285.00 (1.77%)"
-            # 패턴 2: 일반 표기형 "니켈 16,410 ... 1.77%"
-            if "니켈(Ni)" not in parsed_prices:
-                ni_match = re.search(r'니켈[^\d\n\r]*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)[^\n\r]*?([▲▼+-])\s*([\d,]+(?:\.\d+)?)\s*\(?\s*([\d.]+)\s*%\)?', clean_body)
-                if ni_match:
-                    price = float(ni_match.group(1).replace(',', ''))
-                    sign = "-" if ni_match.group(2) in ["▼", "-"] else "+"
-                    change_rate = f"{sign}{float(ni_match.group(4)):.2f}%"
-                    parsed_prices["니켈(Ni)"] = (price, change_rate)
-                    print(f"✓ [KOMIS 실물 공시] 니켈: {price} USD/ton ({change_rate})")
+            for tr in rows:
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if len(cells) >= 3:
+                    item_name = cells[0].replace(" ", "")
+                    
+                    target_key = None
+                    if item_name == "니켈":
+                        target_key = "니켈(Ni)"
+                    elif item_name == "아연":
+                        target_key = "아연(Zn)"
 
-            if "아연(Zn)" not in parsed_prices:
-                zn_match = re.search(r'아연[^\d\n\r]*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)[^\n\r]*?([▲▼+-])\s*([\d,]+(?:\.\d+)?)\s*\(?\s*([\d.]+)\s*%\)?', clean_body)
-                if zn_match:
-                    price = float(zn_match.group(1).replace(',', ''))
-                    sign = "-" if zn_match.group(2) in ["▼", "-"] else "+"
-                    change_rate = f"{sign}{float(zn_match.group(4)):.2f}%"
-                    parsed_prices["아연(Zn)"] = (price, change_rate)
-                    print(f"✓ [KOMIS 실물 공시] 아연: {price} USD/ton ({change_rate})")
+                    if target_key and target_key not in parsed_prices:
+                        try:
+                            # 1번째 셀: 가격 (예: 16,050 또는 3,957)
+                            raw_price = cells[1].replace(",", "").strip()
+                            price = float(raw_price)
 
-            # 둘 다 찾았으면 메일 탐색 종료
+                            # 2번째 셀: 변동폭/등락률 (예: ▲ 0.00(0.00%) 또는 ▼ 103.00(2.54%))
+                            rate_text = cells[2]
+                            rate_match = re.search(r'([▲▼+-]?)\s*[\d,.]+\s*\(\s*([\d.]+)\s*%\s*\)', rate_text)
+                            if rate_match:
+                                sign_char = rate_match.group(1)
+                                sign = "-" if sign_char in ["▼", "-"] else "+"
+                                percent_val = float(rate_match.group(2))
+                                change_rate = f"{sign}{percent_val:.2f}%"
+                            else:
+                                change_rate = "+0.00%"
+
+                            parsed_prices[target_key] = (price, change_rate)
+                            print(f"✓ [KOMIS 실물 공시] {target_key}: {price} USD/ton ({change_rate})")
+                        except Exception as parse_err:
+                            print(f"[{item_name}] 행 파싱 실패: {parse_err}")
+
             if "니켈(Ni)" in parsed_prices and "아연(Zn)" in parsed_prices:
                 break
 
