@@ -20,7 +20,6 @@ GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
 GMAIL_USER = os.environ.get("GMAIL_USER", "").strip()
 GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "").replace(" ", "").strip()
 
-# Google GenAI 최신 표준 클라이언트 초기화
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # 2. 품목별 데이터 소스 매핑
@@ -75,7 +74,6 @@ def fetch_komis_mail_data():
         mail.login(GMAIL_USER, GMAIL_APP_PASS)
         mail.select("inbox")
 
-        # KOMIS 발신 메일 우선 검색
         status, messages = mail.search(None, '(FROM "komis")')
         msg_ids = messages[0].split() if status == "OK" and messages[0] else []
 
@@ -147,7 +145,7 @@ def fetch_komis_mail_data():
                         except Exception as e:
                             print(f"[{item_name}] 가격 파싱 오류: {e}")
 
-            # 2. 시장동향지표 파싱 (니켈, 아연, 철 등)
+            # 2. 시장동향지표 파싱
             for table in tables:
                 header_text = table.get_text()
                 if "시장동향지표" in header_text or "중립" in header_text or "신중" in header_text:
@@ -191,7 +189,6 @@ def fetch_komis_mail_data():
     return parsed_prices, komis_sentiment, recent_reports
 
 def get_yfinance_price(ticker_symbol):
-    """Yahoo Finance 선물 시세 수집"""
     try:
         ticker = yf.Ticker(ticker_symbol)
         hist = ticker.history(period="5d")
@@ -207,7 +204,6 @@ def get_yfinance_price(ticker_symbol):
     return 0.0, "+0.00%"
 
 def get_naphtha_price():
-    """나프타: 브렌트유 * 8.5 배수 연동 산출"""
     try:
         ticker = yf.Ticker("BZ=F")
         hist = ticker.history(period="5d")
@@ -254,7 +250,7 @@ def fetch_latest_market_news(conf):
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
 def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, komis_sentiment, recent_reports):
-    """신규 Google GenAI SDK를 이용한 정밀 시황 요약 분석 (503 및 429 쿼터 초과 자동 대기 포함)"""
+    """신규 Google GenAI SDK를 이용한 정밀 시황 요약 분석"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -288,8 +284,7 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
 2. 경영진 보고용 격식체 한국어 1문장(50~80자 내외)으로 작성하세요.
 3. 반드시 "시황 요약: [원인 및 시장 이슈] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-        # 최대 3회 시도
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = gemini_client.models.generate_content(
                     model="gemini-3.8-flash",
@@ -302,24 +297,16 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
                     return formatted
             except Exception as e:
                 err_msg = str(e)
-                # 429 Quota Exceeded (할당량 초과) 발생 시: 구글 권장 대기 시간(11초) 후 재시도
-                if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                    print(f"[{item_name}] API 호출 속도 제한(429). 11초 대기 후 재시도합니다... (시도 {attempt+1}/3)")
-                    time.sleep(11)
-                # 503 일시 서버 과부하 발생 시
-                elif "503" in err_msg or "UNAVAILABLE" in err_msg:
-                    wait_time = (attempt + 1) * 3
-                    print(f"[{item_name}] 서버 일시 과부하(503). {wait_time}초 후 재시도... (시도 {attempt+1}/3)")
-                    time.sleep(wait_time)
+                if attempt == 0 and ("503" in err_msg or "UNAVAILABLE" in err_msg):
+                    time.sleep(3)
                 else:
-                    print(f"[{item_name}] Gemini 호출 실패: {e}")
+                    print(f"[{item_name}] Gemini 호출 예외: {e}")
                     break
 
-    # 폴백 문구
     sentiment_fallback = f"KOMIS {komis_sentiment.get(short_key, '시장')} 지표 추이 및 " if short_key in komis_sentiment else ""
     return f"시황 요약: {sentiment_fallback}글로벌 수급 변동 영향으로 {direction_text}"
+
 def get_latest_sheet_prices(sheet):
-    """시트에 누적된 직전 실제 거래 단가 조회"""
     latest_prices = {}
     try:
         records = sheet.get_all_values()
@@ -344,7 +331,6 @@ def main():
     kst = timezone(timedelta(hours=9))
     today_str = datetime.now(kst).strftime("%Y-%m-%d")
 
-    # 1. 구글 스프레드시트 연결
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     key_dict = json.loads(GCP_SA_KEY)
     creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
@@ -353,8 +339,6 @@ def main():
     sheet = doc.sheet1
 
     last_prices = get_latest_sheet_prices(sheet)
-
-    # 2. KOMIS 메일 수신 데이터 파싱
     komis_prices, komis_sentiment, recent_reports = fetch_komis_mail_data()
 
     final_rows = []
@@ -377,7 +361,8 @@ def main():
 
         risk = calculate_risk_level(change_rate)
 
-        if idx > 0 and GEMINI_API_KEY:
+        # 품목 간 1.5초 안정 텀
+        if idx > 0 and gemini_client:
             time.sleep(1.5)
 
         summary = analyze_news_with_gemini(
@@ -386,7 +371,6 @@ def main():
         row = [today_str, item, price, conf["unit"], change_rate, risk, summary]
         final_rows.append(row)
 
-    # 3. 구글 시트 적재
     try:
         sheet.append_rows(final_rows)
         print(f"\n[성공] [{today_str}] KOMIS 공시가 및 자원동향 분석 데이터 5건 시트 적재 완료!")
