@@ -71,27 +71,33 @@ def fetch_komis_mail_prices():
         mail.login(GMAIL_USER, GMAIL_APP_PASS)
         mail.select("inbox")
 
-        # 1. 영문 발신자 'komis'로 검색 (한글 인코딩 에러 원천 차단)
+        # 1. 'komis' 발신 메일 우선 검색
         status, messages = mail.search(None, '(FROM "komis")')
         msg_ids = messages[0].split() if status == "OK" and messages[0] else []
 
-        # 2. 발신자 검색 결과가 없을 경우 최근 수신 메일 전체 중 최신 10건 검색
+        # 발신자 조건으로 안 잡히면 최근 메일 전체 20건 검사
         if not msg_ids:
-            status, all_messages = mail.search(None, 'ALL')
-            if status == "OK" and all_messages[0]:
-                msg_ids = all_messages[0].split()
+            status, all_msgs = mail.search(None, 'ALL')
+            if status == "OK" and all_msgs[0]:
+                msg_ids = all_msgs[0].split()
 
         if not msg_ids:
             print("[KOMIS 메일] 메일함에서 메일을 찾을 수 없습니다.")
             mail.logout()
             return parsed_prices
 
-        # 최신 메일 10건을 역순으로 검사하여 니켈/아연 데이터 추출
-        for msg_id in reversed(msg_ids[-10:]):
+        # 최근 메일 15건을 최신순으로 역순 탐색
+        for msg_id in reversed(msg_ids[-15:]):
             _, data = mail.fetch(msg_id, "(RFC822)")
             raw_email = data[0][1]
             msg = email.message_from_bytes(raw_email)
 
+            # 메일 제목 디코딩
+            subject, encoding = decode_header(msg.get("Subject", ""))[0]
+            if isinstance(subject, bytes):
+                subject = subject.decode(encoding or "utf-8", errors="ignore")
+
+            # 본문 추출
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -105,24 +111,37 @@ def fetch_komis_mail_prices():
                 if payload:
                     body = payload.decode("utf-8", errors="ignore")
 
-            # 니켈: "니켈 [ 16,410] ... ▲285.00(1.77%)"
-            ni_match = re.search(r'니켈\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])\s*([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
-            if ni_match and "니켈(Ni)" not in parsed_prices:
-                price = float(ni_match.group(1).replace(',', ''))
-                sign = "+" if ni_match.group(2) == "▲" else "-"
-                change_rate = f"{sign}{float(ni_match.group(4)):.2f}%"
-                parsed_prices["니켈(Ni)"] = (price, change_rate)
-                print(f"✓ [KOMIS 실물 공시] 니켈: {price} USD/ton ({change_rate})")
+            # 메일에 '니켈'이나 '아연'이 포함된 경우 탐색
+            if "니켈" not in body and "아연" not in body:
+                continue
 
-            # 아연: "아연 [ 4,006] ... ▼12.00(0.30%)"
-            zn_match = re.search(r'아연\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])\s*([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
-            if zn_match and "아연(Zn)" not in parsed_prices:
-                price = float(zn_match.group(1).replace(',', ''))
-                sign = "+" if zn_match.group(2) == "▲" else "-"
-                change_rate = f"{sign}{float(zn_match.group(4)):.2f}%"
-                parsed_prices["아연(Zn)"] = (price, change_rate)
-                print(f"✓ [KOMIS 실물 공시] 아연: {price} USD/ton ({change_rate})")
+            print(f"🔍 [메일 확인 중] 제목: {subject}")
 
+            # HTML 태그 제거하여 순수 텍스트 정제
+            clean_body = re.sub(r'<[^>]+>', ' ', body)
+            clean_body = re.sub(r'&nbsp;', ' ', clean_body)
+
+            # 패턴 1: 대괄호 표기형 "니켈 [ 16,410] ... ▲ 285.00 (1.77%)"
+            # 패턴 2: 일반 표기형 "니켈 16,410 ... 1.77%"
+            if "니켈(Ni)" not in parsed_prices:
+                ni_match = re.search(r'니켈[^\d\n\r]*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)[^\n\r]*?([▲▼+-])\s*([\d,]+(?:\.\d+)?)\s*\(?\s*([\d.]+)\s*%\)?', clean_body)
+                if ni_match:
+                    price = float(ni_match.group(1).replace(',', ''))
+                    sign = "-" if ni_match.group(2) in ["▼", "-"] else "+"
+                    change_rate = f"{sign}{float(ni_match.group(4)):.2f}%"
+                    parsed_prices["니켈(Ni)"] = (price, change_rate)
+                    print(f"✓ [KOMIS 실물 공시] 니켈: {price} USD/ton ({change_rate})")
+
+            if "아연(Zn)" not in parsed_prices:
+                zn_match = re.search(r'아연[^\d\n\r]*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)[^\n\r]*?([▲▼+-])\s*([\d,]+(?:\.\d+)?)\s*\(?\s*([\d.]+)\s*%\)?', clean_body)
+                if zn_match:
+                    price = float(zn_match.group(1).replace(',', ''))
+                    sign = "-" if zn_match.group(2) in ["▼", "-"] else "+"
+                    change_rate = f"{sign}{float(zn_match.group(4)):.2f}%"
+                    parsed_prices["아연(Zn)"] = (price, change_rate)
+                    print(f"✓ [KOMIS 실물 공시] 아연: {price} USD/ton ({change_rate})")
+
+            # 둘 다 찾았으면 메일 탐색 종료
             if "니켈(Ni)" in parsed_prices and "아연(Zn)" in parsed_prices:
                 break
 
