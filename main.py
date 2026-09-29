@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 import yfinance as yf
 import feedparser
+from bs4 import BeautifulSoup
 import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -22,7 +23,7 @@ GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "").replace(" ", "").strip()
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# 2. 품목별 데이터 소스 설정
+# 2. 품목별 데이터 소스 매핑
 ITEMS_CONFIG = {
     "유가(WTI)": {
         "source": "yfinance",
@@ -59,14 +60,15 @@ ITEMS_CONFIG = {
     }
 }
 
-from bs4 import BeautifulSoup
-
-def fetch_komis_mail_prices():
-    """KOMIS 뉴스레터 메일 본문(HTML Table)에서 실제 LME CASH 니켈·아연 단가/등락률 정확 추출"""
+def fetch_komis_mail_data():
+    """KOMIS 메일에서 가격, 시장동향지표, 최근 자원동향 리포트 제목 파싱"""
     parsed_prices = {}
+    komis_sentiment = {}
+    recent_reports = []
+
     if not GMAIL_USER or not GMAIL_APP_PASS:
         print("[메일 건너뜀] GMAIL_USER 또는 GMAIL_APP_PASS 시크릿 미설정")
-        return parsed_prices
+        return parsed_prices, komis_sentiment, recent_reports
 
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -84,9 +86,8 @@ def fetch_komis_mail_prices():
         if not msg_ids:
             print("[KOMIS 메일] 메일함에서 메일을 찾을 수 없습니다.")
             mail.logout()
-            return parsed_prices
+            return parsed_prices, komis_sentiment, recent_reports
 
-        # 최신 메일 10건 탐색
         for msg_id in reversed(msg_ids[-10:]):
             _, data = mail.fetch(msg_id, "(RFC822)")
             raw_email = data[0][1]
@@ -112,17 +113,15 @@ def fetch_komis_mail_prices():
             if "니켈" not in body and "아연" not in body:
                 continue
 
-            print(f"🔍 [메일 확인 중] 제목: {subject}")
-
-            # BeautifulSoup으로 HTML 테이블 정밀 파싱
+            print(f"🔍 [KOMIS 메일 분석] 제목: {subject}")
             soup = BeautifulSoup(body, "html.parser")
-            rows = soup.find_all("tr")
+            tables = soup.find_all("table")
 
-            for tr in rows:
+            # 1. 가격 표 파싱
+            for tr in soup.find_all("tr"):
                 cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
                 if len(cells) >= 3:
                     item_name = cells[0].replace(" ", "")
-                    
                     target_key = None
                     if item_name == "니켈":
                         target_key = "니켈(Ni)"
@@ -131,11 +130,8 @@ def fetch_komis_mail_prices():
 
                     if target_key and target_key not in parsed_prices:
                         try:
-                            # 1번째 셀: 가격 (예: 16,050 또는 3,957)
                             raw_price = cells[1].replace(",", "").strip()
                             price = float(raw_price)
-
-                            # 2번째 셀: 변동폭/등락률 (예: ▲ 0.00(0.00%) 또는 ▼ 103.00(2.54%))
                             rate_text = cells[2]
                             rate_match = re.search(r'([▲▼+-]?)\s*[\d,.]+\s*\(\s*([\d.]+)\s*%\s*\)', rate_text)
                             if rate_match:
@@ -145,23 +141,55 @@ def fetch_komis_mail_prices():
                                 change_rate = f"{sign}{percent_val:.2f}%"
                             else:
                                 change_rate = "+0.00%"
-
                             parsed_prices[target_key] = (price, change_rate)
-                            print(f"✓ [KOMIS 실물 공시] {target_key}: {price} USD/ton ({change_rate})")
-                        except Exception as parse_err:
-                            print(f"[{item_name}] 행 파싱 실패: {parse_err}")
+                            print(f"✓ [KOMIS 공시가] {target_key}: {price} USD/ton ({change_rate})")
+                        except Exception as e:
+                            print(f"[{item_name}] 가격 파싱 오류: {e}")
+
+            # 2. 시장동향지표 파싱 (헤더: 리튬, 니켈, 유연탄, 철, 우라늄, 아연, 흑연)
+            for table in tables:
+                header_text = table.get_text()
+                if "시장동향지표" in header_text or "중립" in header_text or "신중" in header_text:
+                    rows = table.find_all("tr")
+                    for i in range(len(rows) - 1):
+                        headers = [th.get_text(strip=True) for th in rows[i].find_all(["th", "td"])]
+                        values = [td.get_text(strip=True) for td in rows[i+1].find_all(["td", "th"])]
+                        if len(headers) == len(values) and "니켈" in headers:
+                            for h, v in zip(headers, values):
+                                clean_h = h.strip()
+                                if clean_h in ["니켈", "아연", "철"]:
+                                    komis_sentiment[clean_h] = v
+                    if komis_sentiment:
+                        break
+
+            # 3. 최근 자원동향 보고서 제목 파싱
+            for table in tables:
+                table_text = table.get_text()
+                if "최근 자원동향" in table_text or "주간자원뉴스" in table_text:
+                    for tr in table.find_all("tr"):
+                        tds = tr.find_all("td")
+                        if len(tds) >= 3:
+                            title = tds[2].get_text(strip=True)
+                            if title and title != "제목" and len(title) > 4:
+                                recent_reports.append(title)
+                    if recent_reports:
+                        break
+
+            if komis_sentiment:
+                print(f"✓ [KOMIS 시장동향지표] {komis_sentiment}")
+            if recent_reports:
+                print(f"✓ [KOMIS 최근동향 보고서] {recent_reports[:2]}")
 
             if "니켈(Ni)" in parsed_prices and "아연(Zn)" in parsed_prices:
                 break
 
         mail.logout()
     except Exception as e:
-        print(f"[KOMIS 메일 연동/파싱 예외] {e}")
+        print(f"[KOMIS 파싱 예외] {e}")
 
-    return parsed_prices
+    return parsed_prices, komis_sentiment, recent_reports
 
 def get_yfinance_price(ticker_symbol):
-    """Yahoo Finance 선물 종가 수집 (WTI 유가, 철광석)"""
     try:
         ticker = yf.Ticker(ticker_symbol)
         hist = ticker.history(period="5d")
@@ -177,7 +205,6 @@ def get_yfinance_price(ticker_symbol):
     return 0.0, "+0.00%"
 
 def get_naphtha_price():
-    """나프타(Naphtha): 브렌트유(BZ=F) 종가 * 8.5 배수 연동"""
     try:
         ticker = yf.Ticker("BZ=F")
         hist = ticker.history(period="5d")
@@ -223,7 +250,8 @@ def fetch_latest_market_news(conf):
 
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
-def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
+def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, komis_sentiment, recent_reports):
+    """KOMIS 공식 시장동향지표 및 최근 동향 보고서를 반영한 심층 시황 요약"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -232,6 +260,14 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
     except Exception:
         direction_text = "보합 마감"
 
+    # KOMIS 지표 및 보고서 맥락 주입
+    komis_context = ""
+    short_key = item_name.split("(")[0]
+    if short_key in komis_sentiment:
+        komis_context += f"- KOMIS 공식 시장동향지표: {short_key} {komis_sentiment[short_key]}\n"
+    if recent_reports:
+        komis_context += f"- 최근 공시된 광물자원 동향 보고서: {', '.join(recent_reports[:2])}\n"
+
     models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
 
     if GEMINI_API_KEY:
@@ -239,17 +275,18 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
-당신은 글로벌 원자재 및 공급망 전문 수석 애널리스트입니다.
-오늘은 [{today_str}]이며, 분석 품목은 [{item_name}]입니다.
+당신은 원자재 및 공급망 전문 수석 애널리스트입니다.
+오늘은 [{today_str}]이며, 분석 대상 품목은 [{item_name}]입니다.
 금일 단가는 [{price_str}], 전일대비 등락률은 [{change_str}]로 [{direction_text}]했습니다.
 
-[오늘 수집된 글로벌 최신 시장 뉴스 헤드라인]:
-{news_context}
+[수집된 시장 데이터 및 공식 지표]:
+{komis_context if komis_context else '- 일반 시장 지표 기반 분석'}
+- 글로벌 시장 뉴스 헤드라인: {news_context}
 
 [작성 지침]:
-1. 일반론은 배제하고, 수집된 헤드라인의 실제 글로벌 이슈(산유국 정책, 공급 쇼크, 제련수수료, 차익 실현 등)를 반영하세요.
+1. 일반론은 배제하고, KOMIS 시장동향지표 단계(신중/중립/관심 등)나 수급 이슈를 자연스럽게 녹여내세요.
 2. 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
-3. 반드시 "시황 요약: [구체적 이슈 및 수급 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
+3. 반드시 "시황 요약: [원인 및 지표 요약] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
                 res = m.generate_content(prompt, request_options={"timeout": 15}).text.strip().replace("\n", " ").replace("*", "")
                 if res:
@@ -260,17 +297,11 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
             except Exception:
                 continue
 
-    dynamic_fallbacks = {
-        "유가(WTI)": f"WTI 선물 스프레드 변동 및 글로벌 정유사 가동률 조정 영향으로 {direction_text}",
-        "나프타(Naphtha)": f"원료 원가 등락 연동 및 아시아 역내 기초유분 수급 영향으로 {direction_text}",
-        "니켈(Ni)": f"LME 실물 재고 추이 및 인도네시아 광석 수급 마진 영향으로 {direction_text}",
-        "아연(Zn)": f"스팟 제련 수수료(TC) 급변 및 글로벌 정련 아연 수급 영향으로 {direction_text}",
-        "철광석(Iron Ore)": f"중국 항만 철광석 재고 및 주요 제철소 조강 가동률 영향으로 {direction_text}"
-    }
-    return f"시황 요약: {dynamic_fallbacks.get(item_name, '원자재 시장 수급 변동 영향으로 ' + direction_text)}"
+    # 폴백 문구
+    sentiment_fallback = f"KOMIS {komis_sentiment.get(short_key, '시장')} 지표 추이 및 " if short_key in komis_sentiment else ""
+    return f"시황 요약: {sentiment_fallback}글로벌 수급 변동 영향으로 {direction_text}"
 
 def get_latest_sheet_prices(sheet):
-    """시트에 누적된 직전 실제 거래 단가를 역추적 조회"""
     latest_prices = {}
     try:
         records = sheet.get_all_values()
@@ -306,7 +337,7 @@ def main():
     last_prices = get_latest_sheet_prices(sheet)
 
     # 2. KOMIS 메일 수신 데이터 파싱
-    komis_data = fetch_komis_mail_prices()
+    komis_prices, komis_sentiment, recent_reports = fetch_komis_mail_data()
 
     final_rows = []
     print(f"=== [{today_str}] 원자재 일일 시황 및 KOMIS 실물 데이터 적재 시작 ===")
@@ -317,8 +348,8 @@ def main():
         elif conf["source"] == "naphtha_calc":
             price, change_rate = get_naphtha_price()
         elif conf["source"] == "komis_mail":
-            if item in komis_data:
-                price, change_rate = komis_data[item]
+            if item in komis_prices:
+                price, change_rate = komis_prices[item]
             else:
                 price = last_prices.get(item, 0.0)
                 change_rate = "+0.00%"
@@ -331,14 +362,16 @@ def main():
         if idx > 0 and GEMINI_API_KEY:
             time.sleep(1.5)
 
-        summary = analyze_news_with_gemini(item, conf, f"{price} {conf['unit']}", change_rate, today_str)
+        summary = analyze_news_with_gemini(
+            item, conf, f"{price} {conf['unit']}", change_rate, today_str, komis_sentiment, recent_reports
+        )
         row = [today_str, item, price, conf["unit"], change_rate, risk, summary]
         final_rows.append(row)
 
     # 3. 구글 시트 적재
     try:
         sheet.append_rows(final_rows)
-        print(f"\n[성공] [{today_str}] KOMIS 공시가 및 시황 데이터 5건 시트 적재 완료!")
+        print(f"\n[성공] [{today_str}] KOMIS 공시가 및 자원동향 분석 데이터 5건 시트 적재 완료!")
     except Exception as e:
         print(f"Google Sheet 적재 오류: {e}")
         raise e
