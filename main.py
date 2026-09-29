@@ -261,43 +261,47 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
         direction_text = "보합 마감"
 
     # KOMIS 지표 및 보고서 맥락 주입
-    komis_context = ""
+    komis_context = []
     short_key = item_name.split("(")[0]
     if short_key in komis_sentiment:
-        komis_context += f"- KOMIS 공식 시장동향지표: {short_key} {komis_sentiment[short_key]}\n"
+        komis_context.append(f"KOMIS 공식 시장동향지표: {short_key} {komis_sentiment[short_key]}")
     if recent_reports:
-        komis_context += f"- 최근 공시된 광물자원 동향 보고서: {', '.join(recent_reports[:2])}\n"
+        komis_context.append(f"최근 광물자원 동향 보고서 이슈: {', '.join(recent_reports[:2])}")
+    
+    komis_str = "\n".join([f"- {k}" for k in komis_context])
 
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
+    # 지원 모델 목록 (정식 별칭 우선 적용)
+    models_to_try = ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro-latest", "gemini-pro"]
 
     if GEMINI_API_KEY:
-        for model_name in models_to_try:
-            try:
-                m = genai.GenerativeModel(model_name)
-                prompt = f"""
+        prompt = f"""
 당신은 원자재 및 공급망 전문 수석 애널리스트입니다.
 오늘은 [{today_str}]이며, 분석 대상 품목은 [{item_name}]입니다.
 금일 단가는 [{price_str}], 전일대비 등락률은 [{change_str}]로 [{direction_text}]했습니다.
 
 [수집된 시장 데이터 및 공식 지표]:
-{komis_context if komis_context else '- 일반 시장 지표 기반 분석'}
+{komis_str if komis_str else '- 일반 글로벌 시장 지표'}
 - 글로벌 시장 뉴스 헤드라인: {news_context}
 
 [작성 지침]:
-1. 일반론은 배제하고, KOMIS 시장동향지표 단계(신중/중립/관심 등)나 수급 이슈를 자연스럽게 녹여내세요.
-2. 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
-3. 반드시 "시황 요약: [원인 및 지표 요약] 영향으로 {direction_text}" 형식으로만 답변하세요.
+1. 단순 일반론을 배제하고, 수집된 뉴스 이슈(산유국 정책, 공급 쇼크, 제련수수료, 차익 실현 등)나 KOMIS 지표(신중/중립/관심)의 맥락을 구체적으로 반영하세요.
+2. 경영진 보고용 격식체 한국어 1문장(50~80자 내외)으로 작성하세요.
+3. 반드시 "시황 요약: [구체적 원인 및 시장 이슈] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-                res = m.generate_content(prompt, request_options={"timeout": 15}).text.strip().replace("\n", " ").replace("*", "")
+        for model_name in models_to_try:
+            try:
+                m = genai.GenerativeModel(model_name)
+                res = m.generate_content(prompt, request_options={"timeout": 20}).text.strip().replace("\n", " ").replace("*", "")
                 if res:
                     clean_res = res.strip()
                     formatted = clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
-                    print(f"✓ [{item_name}] Gemini({model_name}) 요약 완료: {formatted}")
+                    print(f"✓ [{item_name}] Gemini({model_name}) 심층 요약 성공: {formatted}")
                     return formatted
-            except Exception:
+            except Exception as e:
+                print(f"[{item_name}] Gemini 모델({model_name}) 호출 실패: {e}")
                 continue
 
-    # 폴백 문구
+    # 비상용 폴백 문구
     sentiment_fallback = f"KOMIS {komis_sentiment.get(short_key, '시장')} 지표 추이 및 " if short_key in komis_sentiment else ""
     return f"시황 요약: {sentiment_fallback}글로벌 수급 변동 영향으로 {direction_text}"
 
