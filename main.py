@@ -71,19 +71,23 @@ def fetch_komis_mail_prices():
         mail.login(GMAIL_USER, GMAIL_APP_PASS)
         mail.select("inbox")
 
-        # 발신자 또는 제목으로 최근 KOMIS 메일 검색
-        status, messages = mail.search(None, '(OR FROM "komis" SUBJECT "뉴스레터")')
-        if status != "OK" or not messages[0]:
-            status, messages = mail.search(None, 'ALL')
+        # 1. 영문 발신자 'komis'로 검색 (한글 인코딩 에러 원천 차단)
+        status, messages = mail.search(None, '(FROM "komis")')
+        msg_ids = messages[0].split() if status == "OK" and messages[0] else []
 
-        msg_ids = messages[0].split()
+        # 2. 발신자 검색 결과가 없을 경우 최근 수신 메일 전체 중 최신 10건 검색
+        if not msg_ids:
+            status, all_messages = mail.search(None, 'ALL')
+            if status == "OK" and all_messages[0]:
+                msg_ids = all_messages[0].split()
+
         if not msg_ids:
             print("[KOMIS 메일] 메일함에서 메일을 찾을 수 없습니다.")
             mail.logout()
             return parsed_prices
 
-        # 최신 메일 3건까지 역순 탐색 (KOMIS 본문 매칭 확인)
-        for msg_id in reversed(msg_ids[-3:]):
+        # 최신 메일 10건을 역순으로 검사하여 니켈/아연 데이터 추출
+        for msg_id in reversed(msg_ids[-10:]):
             _, data = mail.fetch(msg_id, "(RFC822)")
             raw_email = data[0][1]
             msg = email.message_from_bytes(raw_email)
@@ -91,7 +95,8 @@ def fetch_komis_mail_prices():
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
-                    if part.get_content_type() in ["text/plain", "text/html"]:
+                    content_type = part.get_content_type()
+                    if content_type in ["text/plain", "text/html"]:
                         payload = part.get_payload(decode=True)
                         if payload:
                             body += payload.decode("utf-8", errors="ignore")
