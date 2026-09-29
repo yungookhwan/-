@@ -1,7 +1,7 @@
-google-generativeai
+google-genai
+yfinance
+feedparser
+beautifulsoup4
 gspread
 oauth2client
-feedparser
-yfinance
-requests
-beautifulsoup4
+pandas
