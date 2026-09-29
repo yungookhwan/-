@@ -7,16 +7,15 @@ from urllib.parse import quote
 import pandas as pd
 import yfinance as yf
 import feedparser
-import google.generativeai as genai
+from google import genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# 1. 인증키 로드
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# 1. 인증키 로드 및 신규 GenAI 클라이언트 초기화
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # 2. 품목별 티커 및 설정 (일일 main.py와 100% 동기화)
 TICKERS_CONFIG = {
@@ -44,7 +43,7 @@ TICKERS_CONFIG = {
     "니켈(Ni)": {
         "ticker": "HG=F",
         "unit": "USD/ton",
-        "current_target": 16500.0,
+        "current_target": 16050.0,  # 최신 KOMIS 실물 공시단가 동기화
         "type": "recent_anchored_metal",
         "search_query": "LME Nickel price Indonesia supply monthly",
         "ko_query": "니켈 가격 LME 스테인리스 인도네시아 월간"
@@ -52,7 +51,7 @@ TICKERS_CONFIG = {
     "아연(Zn)": {
         "ticker": "HG=F",
         "unit": "USD/ton",
-        "current_target": 3950.0,
+        "current_target": 3957.0,   # 최신 KOMIS 실물 공시단가 동기화
         "type": "recent_anchored_metal",
         "search_query": "LME Zinc price smelter TC treatment charges monthly",
         "ko_query": "아연 가격 제련 수수료 도금재 LME 월간"
@@ -127,20 +126,15 @@ MONTHLY_MARKET_ISSUES = {
 }
 
 def generate_monthly_gemini_summary(item_name, conf, month_str, price_str, change_str, direction_text):
-    """사전 외 신규 월간 데이터 발생 시 최신 Gemini 엔진으로 월간 거시 시황 분석"""
+    """신규 Google GenAI(gemini-3.8-flash) 엔진 기반 월간 거시 시황 분석"""
     q_en = conf.get("search_query", "")
     rss_url = f"https://news.google.com/rss/search?q={quote(q_en)}&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss_url)
     titles = [entry.title for entry in feed.entries[:3] if hasattr(entry, 'title') and entry.title]
     news_context = " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 원자재 선물 수급 동향"
 
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
-
-    if GEMINI_API_KEY:
-        for model_name in models_to_try:
-            try:
-                m = genai.GenerativeModel(model_name)
-                prompt = f"""
+    if gemini_client:
+        prompt = f"""
 당신은 글로벌 원자재 시장 및 공급망 전문 수석 애널리스트입니다.
 기준 기간은 [{month_str} 월간 집계]이며, 품목은 [{item_name}]입니다.
 월평균 단가는 [{price_str}], 전월 대비 등락률은 [{change_str}]로 [{direction_text}]했습니다.
@@ -153,13 +147,20 @@ def generate_monthly_gemini_summary(item_name, conf, month_str, price_str, chang
 2. 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
 3. 반드시 "시황 요약: [구체적 이슈 및 수급 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-                res = m.generate_content(prompt).text.strip().replace("\n", " ").replace("*", "")
+        for attempt in range(2):
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=prompt
+                )
+                res = response.text.strip().replace("\n", " ").replace("*", "")
                 if res:
-                    clean_res = res.strip()
-                    return clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
+                    formatted = res if res.startswith("시황 요약:") else f"시황 요약: {res}"
+                    print(f"✓ [{item_name}] 월간 Gemini(gemini-3.8-flash) 요약 성공: {formatted}")
+                    return formatted
             except Exception as e:
-                print(f"[{item_name}] 월간 Gemini({model_name}) 예외: {e}")
-                continue
+                print(f"[{item_name}] 월간 Gemini 호출 예외: {e}")
+                time.sleep(2)
 
     market_drivers = {
         "유가(WTI)": "산유국 공급 통제 및 글로벌 원유 재고 변동",
