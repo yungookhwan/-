@@ -269,7 +269,6 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
     if short_key in komis_sentiment:
         komis_context.append(f"KOMIS 공식 시장동향지표: {short_key} {komis_sentiment[short_key]}")
     if recent_reports:
-        # 보고서 문단 핵심 요약 (앞부분 150자 반영)
         brief_text = " / ".join([r[:150] for r in recent_reports[:2]])
         komis_context.append(f"KOMIS 최신 자원동향 브리프: {brief_text}")
     
@@ -290,8 +289,8 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
 2. 경영진 보고용 격식체 한국어 1문장(50~80자 내외)으로 작성하세요.
 3. 반드시 "시황 요약: [원인 및 시장 이슈] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-        # 최신 모델 식별자 순차 시도
-        for model_id in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+        # 로그에서 명시적으로 요구한 gemini-3.8-flash 적용
+        for model_id in ["gemini-3.8-flash", "gemini-2.0-flash"]:
             try:
                 response = gemini_client.models.generate_content(
                     model=model_id,
