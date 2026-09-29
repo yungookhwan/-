@@ -16,15 +16,13 @@ from oauth2client.service_account import ServiceAccountCredentials
 # 1. API 키 및 인증 환경변수 로드
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
-GMAIL_USER = os.environ.get("GMAIL_USER", "")
-GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "")
+GMAIL_USER = os.environ.get("GMAIL_USER", "").strip()
+GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "").replace(" ", "").strip()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-else:
-    print("[경고] GEMINI_API_KEY가 비어 있습니다. GitHub Secrets를 확인하세요.")
 
-# 2. 품목별 데이터 소스 매핑 (인위적 기준단가 제거, 순수 공시/선물 체계 구축)
+# 2. 품목별 데이터 소스 설정
 ITEMS_CONFIG = {
     "유가(WTI)": {
         "source": "yfinance",
@@ -73,56 +71,59 @@ def fetch_komis_mail_prices():
         mail.login(GMAIL_USER, GMAIL_APP_PASS)
         mail.select("inbox")
 
-        # KOMIS 발신 메일 검색
-        status, messages = mail.search(None, '(FROM "komis@komis.or.kr")')
+        # 발신자 또는 제목으로 최근 KOMIS 메일 검색
+        status, messages = mail.search(None, '(OR FROM "komis" SUBJECT "뉴스레터")')
         if status != "OK" or not messages[0]:
-            status, messages = mail.search(None, '(SUBJECT "뉴스레터")')
+            status, messages = mail.search(None, 'ALL')
 
         msg_ids = messages[0].split()
         if not msg_ids:
-            print("[KOMIS 메일] 수신된 뉴스레터를 찾을 수 없습니다.")
+            print("[KOMIS 메일] 메일함에서 메일을 찾을 수 없습니다.")
             mail.logout()
             return parsed_prices
 
-        # 최신 메일 본문 수신
-        latest_id = msg_ids[-1]
-        _, data = mail.fetch(latest_id, "(RFC822)")
-        raw_email = data[0][1]
-        msg = email.message_from_bytes(raw_email)
+        # 최신 메일 3건까지 역순 탐색 (KOMIS 본문 매칭 확인)
+        for msg_id in reversed(msg_ids[-3:]):
+            _, data = mail.fetch(msg_id, "(RFC822)")
+            raw_email = data[0][1]
+            msg = email.message_from_bytes(raw_email)
 
-        body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                if part.get_content_type() in ["text/plain", "text/html"]:
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        body += payload.decode("utf-8", errors="ignore")
-        else:
-            payload = msg.get_payload(decode=True)
-            if payload:
-                body = payload.decode("utf-8", errors="ignore")
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() in ["text/plain", "text/html"]:
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body += payload.decode("utf-8", errors="ignore")
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    body = payload.decode("utf-8", errors="ignore")
 
-        # 1. 니켈: "니켈 [ 16,410] ... ▲285.00(1.77%)"
-        ni_match = re.search(r'니켈\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
-        if ni_match:
-            price = float(ni_match.group(1).replace(',', ''))
-            sign = "+" if ni_match.group(2) == "▲" else "-"
-            change_rate = f"{sign}{float(ni_match.group(4)):.2f}%"
-            parsed_prices["니켈(Ni)"] = (price, change_rate)
-            print(f"✓ [KOMIS 실물 공시] 니켈: {price} USD/ton ({change_rate})")
+            # 니켈: "니켈 [ 16,410] ... ▲285.00(1.77%)"
+            ni_match = re.search(r'니켈\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])\s*([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
+            if ni_match and "니켈(Ni)" not in parsed_prices:
+                price = float(ni_match.group(1).replace(',', ''))
+                sign = "+" if ni_match.group(2) == "▲" else "-"
+                change_rate = f"{sign}{float(ni_match.group(4)):.2f}%"
+                parsed_prices["니켈(Ni)"] = (price, change_rate)
+                print(f"✓ [KOMIS 실물 공시] 니켈: {price} USD/ton ({change_rate})")
 
-        # 2. 아연: "아연 [ 4,006] ... ▼12.00(0.30%)"
-        zn_match = re.search(r'아연\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
-        if zn_match:
-            price = float(zn_match.group(1).replace(',', ''))
-            sign = "+" if zn_match.group(2) == "▲" else "-"
-            change_rate = f"{sign}{float(zn_match.group(4)):.2f}%"
-            parsed_prices["아연(Zn)"] = (price, change_rate)
-            print(f"✓ [KOMIS 실물 공시] 아연: {price} USD/ton ({change_rate})")
+            # 아연: "아연 [ 4,006] ... ▼12.00(0.30%)"
+            zn_match = re.search(r'아연\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])\s*([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
+            if zn_match and "아연(Zn)" not in parsed_prices:
+                price = float(zn_match.group(1).replace(',', ''))
+                sign = "+" if zn_match.group(2) == "▲" else "-"
+                change_rate = f"{sign}{float(zn_match.group(4)):.2f}%"
+                parsed_prices["아연(Zn)"] = (price, change_rate)
+                print(f"✓ [KOMIS 실물 공시] 아연: {price} USD/ton ({change_rate})")
+
+            if "니켈(Ni)" in parsed_prices and "아연(Zn)" in parsed_prices:
+                break
 
         mail.logout()
     except Exception as e:
-        print(f"[KOMIS 파싱 예외] {e}")
+        print(f"[KOMIS 메일 연동/파싱 예외] {e}")
 
     return parsed_prices
 
@@ -198,7 +199,7 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
     except Exception:
         direction_text = "보합 마감"
 
-    models_to_try = ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.5-flash"]
+    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
 
     if GEMINI_API_KEY:
         for model_name in models_to_try:
@@ -213,7 +214,7 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
 {news_context}
 
 [작성 지침]:
-1. 일반론은 배제하고, 수집된 헤드라인의 실제 사건(산유국 정책, 공급 쇼크, 제련수수료, 차익 실현 등)을 직접 언급하세요.
+1. 일반론은 배제하고, 수집된 헤드라인의 실제 글로벌 이슈(산유국 정책, 공급 쇼크, 제련수수료, 차익 실현 등)를 반영하세요.
 2. 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
 3. 반드시 "시황 요약: [구체적 이슈 및 수급 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
@@ -221,7 +222,7 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
                 if res:
                     clean_res = res.strip()
                     formatted = clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
-                    print(f"✓ [{item_name}] Gemini({model_name}) 요약 성공: {formatted}")
+                    print(f"✓ [{item_name}] Gemini({model_name}) 요약 완료: {formatted}")
                     return formatted
             except Exception:
                 continue
@@ -283,11 +284,9 @@ def main():
         elif conf["source"] == "naphtha_calc":
             price, change_rate = get_naphtha_price()
         elif conf["source"] == "komis_mail":
-            # 1순위: 오늘자 KOMIS 메일 실물 공시가
             if item in komis_data:
                 price, change_rate = komis_data[item]
             else:
-                # 2순위: 메일 미도착/휴일 시 시트에 적재된 직전 거래일 실제 단가 유지
                 price = last_prices.get(item, 0.0)
                 change_rate = "+0.00%"
                 print(f"ℹ [{item}] KOMIS 메일 미확인으로 직전 거래 단가({price}) 유지")
