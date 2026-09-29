@@ -2,26 +2,29 @@ import os
 import json
 import re
 import time
+import imaplib
+import email
+from email.header import decode_header
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
-import requests
-from bs4 import BeautifulSoup
 import yfinance as yf
 import feedparser
 import google.generativeai as genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# 1. API 키 및 서비스 계정 환경변수 로드
+# 1. API 키 및 인증 환경변수 로드
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
+GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 else:
-    print("[경고] GEMINI_API_KEY 환경변수가 비어 있습니다! GitHub Secrets를 확인하세요.")
+    print("[경고] GEMINI_API_KEY가 비어 있습니다. GitHub Secrets를 확인하세요.")
 
-# 2. 품목별 실제 데이터 소스 및 검색 쿼리 매핑
+# 2. 품목별 데이터 소스 매핑 (인위적 기준단가 제거, 순수 공시/선물 체계 구축)
 ITEMS_CONFIG = {
     "유가(WTI)": {
         "source": "yfinance",
@@ -38,19 +41,13 @@ ITEMS_CONFIG = {
         "ko_query": "나프타 에틸렌 NCC 석유화학"
     },
     "니켈(Ni)": {
-        "source": "metal_proxy",
-        "ticker": "HG=F",
-        "base_val": 16500.0,  # KOMIS 실제 시세 기준점
-        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
+        "source": "komis_mail",
         "unit": "USD/ton",
         "search_query": "LME Nickel price Indonesia supply",
         "ko_query": "니켈 가격 LME 스테인리스 인도네시아"
     },
     "아연(Zn)": {
-        "source": "metal_proxy",
-        "ticker": "HG=F",
-        "base_val": 3950.0,   # KOMIS 실제 시세 기준점
-        "damping": 0.20,      # KOMIS 실물 변동성에 맞춘 완충 계수
+        "source": "komis_mail",
         "unit": "USD/ton",
         "search_query": "LME Zinc price smelter TC treatment charges",
         "ko_query": "아연 가격 제련 수수료 도금재 LME"
@@ -64,12 +61,73 @@ ITEMS_CONFIG = {
     }
 }
 
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
+def fetch_komis_mail_prices():
+    """KOMIS 뉴스레터 메일 본문에서 실제 LME CASH 니켈·아연 단가/등락률 파싱"""
+    parsed_prices = {}
+    if not GMAIL_USER or not GMAIL_APP_PASS:
+        print("[메일 건너뜀] GMAIL_USER 또는 GMAIL_APP_PASS 시크릿 미설정")
+        return parsed_prices
+
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(GMAIL_USER, GMAIL_APP_PASS)
+        mail.select("inbox")
+
+        # KOMIS 발신 메일 검색
+        status, messages = mail.search(None, '(FROM "komis@komis.or.kr")')
+        if status != "OK" or not messages[0]:
+            status, messages = mail.search(None, '(SUBJECT "뉴스레터")')
+
+        msg_ids = messages[0].split()
+        if not msg_ids:
+            print("[KOMIS 메일] 수신된 뉴스레터를 찾을 수 없습니다.")
+            mail.logout()
+            return parsed_prices
+
+        # 최신 메일 본문 수신
+        latest_id = msg_ids[-1]
+        _, data = mail.fetch(latest_id, "(RFC822)")
+        raw_email = data[0][1]
+        msg = email.message_from_bytes(raw_email)
+
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() in ["text/plain", "text/html"]:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        body += payload.decode("utf-8", errors="ignore")
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                body = payload.decode("utf-8", errors="ignore")
+
+        # 1. 니켈: "니켈 [ 16,410] ... ▲285.00(1.77%)"
+        ni_match = re.search(r'니켈\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
+        if ni_match:
+            price = float(ni_match.group(1).replace(',', ''))
+            sign = "+" if ni_match.group(2) == "▲" else "-"
+            change_rate = f"{sign}{float(ni_match.group(4)):.2f}%"
+            parsed_prices["니켈(Ni)"] = (price, change_rate)
+            print(f"✓ [KOMIS 실물 공시] 니켈: {price} USD/ton ({change_rate})")
+
+        # 2. 아연: "아연 [ 4,006] ... ▼12.00(0.30%)"
+        zn_match = re.search(r'아연\s*\[\s*([\d,]+(?:\.\d+)?)\s*\].*?([▲▼])([\d,]+(?:\.\d+)?)\s*\(([\d,]+(?:\.\d+)?)%\)', body, re.DOTALL)
+        if zn_match:
+            price = float(zn_match.group(1).replace(',', ''))
+            sign = "+" if zn_match.group(2) == "▲" else "-"
+            change_rate = f"{sign}{float(zn_match.group(4)):.2f}%"
+            parsed_prices["아연(Zn)"] = (price, change_rate)
+            print(f"✓ [KOMIS 실물 공시] 아연: {price} USD/ton ({change_rate})")
+
+        mail.logout()
+    except Exception as e:
+        print(f"[KOMIS 파싱 예외] {e}")
+
+    return parsed_prices
 
 def get_yfinance_price(ticker_symbol):
-    """Yahoo Finance 공식 선물 종가 수집 (유가, 철광석)"""
+    """Yahoo Finance 선물 종가 수집 (WTI 유가, 철광석)"""
     try:
         ticker = yf.Ticker(ticker_symbol)
         hist = ticker.history(period="5d")
@@ -99,29 +157,7 @@ def get_naphtha_price():
         print(f"나프타 산출 오류: {e}")
     return 800.0, "+0.00%"
 
-def get_metal_price_by_proxy(conf, last_price=None):
-    """KOMIS 실물 기준가(16,500 / 3,950) 기반 안정적 일일 등락 산출"""
-    base = last_price if (last_price and last_price > 0) else conf["base_val"]
-    damping = conf.get("damping", 0.20)
-    
-    try:
-        ticker = yf.Ticker(conf["ticker"])
-        hist = ticker.history(period="5d")
-        if len(hist) >= 2:
-            current_idx = hist['Close'].iloc[-1]
-            prev_idx = hist['Close'].iloc[-2]
-            raw_pct_change = ((current_idx - prev_idx) / prev_idx) * 100
-            
-            damped_pct_change = round(raw_pct_change * damping, 2)
-            calc_price = round(base * (1 + (damped_pct_change / 100)), 2)
-            return calc_price, f"{damped_pct_change:+.2f}%"
-    except Exception as e:
-        print(f"비철금속 수집 오류: {e}")
-        
-    return base, "+0.00%"
-
 def calculate_risk_level(change_rate_str):
-    """정량 기준: 1% 미만 LOW, 1%~3% MID, 3% 이상 HIGH"""
     try:
         clean_str = change_rate_str.replace('%', '').replace('+', '').strip()
         rate = abs(float(clean_str))
@@ -135,13 +171,11 @@ def calculate_risk_level(change_rate_str):
         return "LOW"
 
 def fetch_latest_market_news(conf):
-    """글로벌 실제 뉴스 헤드라인 수집 (외신 영문 피드 우선)"""
     titles = []
-    
     q_en = conf.get("search_query", "")
     rss_en = f"https://news.google.com/rss/search?q={quote(q_en + ' when:3d')}&hl=en-US&gl=US&ceid=US:en"
     feed_en = feedparser.parse(rss_en)
-    for entry in feed_en.entries[:4]:
+    for entry in feed_en.entries[:3]:
         if hasattr(entry, 'title') and entry.title:
             titles.append(entry.title)
 
@@ -156,7 +190,6 @@ def fetch_latest_market_news(conf):
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
 def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
-    """최신 고성능 모델(3.8 Flash / 3.1 Pro / 1.5 Pro) 우선 심층 분석"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -165,57 +198,45 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str):
     except Exception:
         direction_text = "보합 마감"
 
-    # 고버전 우선 탐색 순서
-    models_to_try = [
-        "gemini-3.8-flash",
-        "gemini-3.1-pro",
-        "gemini-1.5-pro",
-        "gemini-1.5-flash"
-    ]
+    models_to_try = ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.5-flash"]
 
     if GEMINI_API_KEY:
         for model_name in models_to_try:
             try:
                 m = genai.GenerativeModel(model_name)
                 prompt = f"""
-당신은 글로벌 원자재 및 거시 경제 전문 수석 수석 애널리스트입니다.
-오늘은 [{today_str}]이며, 분석 대상 품목은 [{item_name}]입니다.
+당신은 글로벌 원자재 및 공급망 전문 수석 애널리스트입니다.
+오늘은 [{today_str}]이며, 분석 품목은 [{item_name}]입니다.
 금일 단가는 [{price_str}], 전일대비 등락률은 [{change_str}]로 [{direction_text}]했습니다.
 
 [오늘 수집된 글로벌 최신 시장 뉴스 헤드라인]:
 {news_context}
 
-[작성 지침 - 절대 준수]:
-1. 뻔한 일반론(단순 수급 관망 등)은 엄격히 배제하세요. 수집된 헤드라인에서 확인되는 실제 구체적인 사건(특정 산유국 정책, 공급 쇼크, 제련소 수수료 급락, 롤마진 압박, 차익 실현 등)을 직접 언급하세요.
-2. 금융/구매 전문가 관점에서 인과관계를 명확히 짚어주세요.
-3. 기사 제목을 나열하지 말고 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
-4. 반드시 "시황 요약: [구체적 사건 및 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
+[작성 지침]:
+1. 일반론은 배제하고, 수집된 헤드라인의 실제 사건(산유국 정책, 공급 쇼크, 제련수수료, 차익 실현 등)을 직접 언급하세요.
+2. 경영진 보고용 격식체 한국어 1문장(40~65자)으로 작성하세요.
+3. 반드시 "시황 요약: [구체적 이슈 및 수급 원인] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
                 res = m.generate_content(prompt, request_options={"timeout": 15}).text.strip().replace("\n", " ").replace("*", "")
                 if res:
                     clean_res = res.strip()
                     formatted = clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
-                    print(f"✓ [{item_name}] Gemini({model_name}) 심층 시황 생성 성공: {formatted}")
+                    print(f"✓ [{item_name}] Gemini({model_name}) 요약 성공: {formatted}")
                     return formatted
-            except Exception as e:
-                print(f"[{item_name}] Gemini({model_name}) 호출 대기/실패 ({e}), 다음 모델로 전환합니다.")
+            except Exception:
                 continue
-    else:
-        print(f"[{item_name}] 경고: GEMINI_API_KEY 미설정으로 Fallback 문구가 적용됩니다.")
 
     dynamic_fallbacks = {
         "유가(WTI)": f"WTI 선물 스프레드 변동 및 글로벌 정유사 가동률 조정 영향으로 {direction_text}",
         "나프타(Naphtha)": f"원료 원가 등락 연동 및 아시아 역내 기초유분 수급 영향으로 {direction_text}",
-        "니켈(Ni)": f"LME 등록 재고 추이 및 동남아 NPI 공급 마진 변동 영향으로 {direction_text}",
-        "아연(Zn)": f"글로벌 스팟 제련 수수료(TC) 향방 및 인프라 도금 수요 관망 영향으로 {direction_text}",
+        "니켈(Ni)": f"LME 실물 재고 추이 및 인도네시아 광석 수급 마진 영향으로 {direction_text}",
+        "아연(Zn)": f"스팟 제련 수수료(TC) 급변 및 글로벌 정련 아연 수급 영향으로 {direction_text}",
         "철광석(Iron Ore)": f"중국 항만 철광석 재고 및 주요 제철소 조강 가동률 영향으로 {direction_text}"
     }
-    fallback_text = dynamic_fallbacks.get(item_name, f"글로벌 원자재 시장 매크로 지표 변동 영향으로 {direction_text}")
-    print(f"⚠ [{item_name}] Fallback 문구 적용")
-    return f"시황 요약: {fallback_text}"
+    return f"시황 요약: {dynamic_fallbacks.get(item_name, '원자재 시장 수급 변동 영향으로 ' + direction_text)}"
 
 def get_latest_sheet_prices(sheet):
-    """시트에 최근 적재된 품목별 최종 단가를 역추적 조회"""
+    """시트에 누적된 직전 실제 거래 단가를 역추적 조회"""
     latest_prices = {}
     try:
         records = sheet.get_all_values()
@@ -227,8 +248,6 @@ def get_latest_sheet_prices(sheet):
                 if item not in latest_prices:
                     try:
                         val = float(str(row[2]).replace(',', '').strip())
-                        if item == "아연(Zn)" and val < 3500.0:
-                            continue
                         latest_prices[item] = val
                     except ValueError:
                         pass
@@ -241,7 +260,7 @@ def get_latest_sheet_prices(sheet):
 def main():
     kst = timezone(timedelta(hours=9))
     today_str = datetime.now(kst).strftime("%Y-%m-%d")
-    
+
     # 1. 구글 스프레드시트 연결
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     key_dict = json.loads(GCP_SA_KEY)
@@ -249,38 +268,45 @@ def main():
     gc = gspread.authorize(creds)
     doc = gc.open("원자재_시황_DB")
     sheet = doc.sheet1
-    
+
     last_prices = get_latest_sheet_prices(sheet)
-    
+
+    # 2. KOMIS 메일 수신 데이터 파싱
+    komis_data = fetch_komis_mail_prices()
+
     final_rows = []
-    print(f"=== [{today_str}] 원자재 일일 시황 및 시세 수집 시작 (고버전 Gemini 우선 모드) ===")
+    print(f"=== [{today_str}] 원자재 일일 시황 및 KOMIS 실물 데이터 적재 시작 ===")
 
     for idx, (item, conf) in enumerate(ITEMS_CONFIG.items()):
         if conf["source"] == "yfinance":
             price, change_rate = get_yfinance_price(conf["ticker"])
         elif conf["source"] == "naphtha_calc":
             price, change_rate = get_naphtha_price()
-        elif conf["source"] == "metal_proxy":
-            prev_p = last_prices.get(item, conf["base_val"])
-            price, change_rate = get_metal_price_by_proxy(conf, last_price=prev_p)
+        elif conf["source"] == "komis_mail":
+            # 1순위: 오늘자 KOMIS 메일 실물 공시가
+            if item in komis_data:
+                price, change_rate = komis_data[item]
+            else:
+                # 2순위: 메일 미도착/휴일 시 시트에 적재된 직전 거래일 실제 단가 유지
+                price = last_prices.get(item, 0.0)
+                change_rate = "+0.00%"
+                print(f"ℹ [{item}] KOMIS 메일 미확인으로 직전 거래 단가({price}) 유지")
         else:
             price, change_rate = 0.0, "+0.00%"
-            
+
         risk = calculate_risk_level(change_rate)
-        
-        # 고성능 모델의 Rate Limit 방지를 위한 2초 대기
+
         if idx > 0 and GEMINI_API_KEY:
-            time.sleep(2)
+            time.sleep(1.5)
 
         summary = analyze_news_with_gemini(item, conf, f"{price} {conf['unit']}", change_rate, today_str)
-        
         row = [today_str, item, price, conf["unit"], change_rate, risk, summary]
         final_rows.append(row)
 
-    # 2. 구글 스프레드시트 적재
+    # 3. 구글 시트 적재
     try:
         sheet.append_rows(final_rows)
-        print(f"\n[성공] [{today_str}] 구글 시트에 실제 뉴스 기반 심층 시황 5건 적재 완료!")
+        print(f"\n[성공] [{today_str}] KOMIS 공시가 및 시황 데이터 5건 시트 적재 완료!")
     except Exception as e:
         print(f"Google Sheet 적재 오류: {e}")
         raise e
