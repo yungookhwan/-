@@ -10,18 +10,18 @@ from urllib.parse import quote
 import yfinance as yf
 import feedparser
 from bs4 import BeautifulSoup
-import google.generativeai as genai
+from google import genai
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # 1. API 키 및 인증 환경변수 로드
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GCP_SA_KEY = os.environ.get("GCP_SA_KEY", "")
 GMAIL_USER = os.environ.get("GMAIL_USER", "").strip()
 GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS", "").replace(" ", "").strip()
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# Google GenAI 최신 표준 클라이언트 초기화
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # 2. 품목별 데이터 소스 매핑
 ITEMS_CONFIG = {
@@ -61,13 +61,13 @@ ITEMS_CONFIG = {
 }
 
 def fetch_komis_mail_data():
-    """KOMIS 메일에서 가격, 시장동향지표, 최근 자원동향 리포트 제목 파싱"""
+    """KOMIS 뉴스레터 메일에서 공시단가, 시장동향지표, 최근 자원동향 리포트 추출"""
     parsed_prices = {}
     komis_sentiment = {}
     recent_reports = []
 
     if not GMAIL_USER or not GMAIL_APP_PASS:
-        print("[메일 건너뜀] GMAIL_USER 또는 GMAIL_APP_PASS 시크릿 미설정")
+        print("[메일 건너뜀] GMAIL_USER 또는 GMAIL_APP_PASS 환경변수 미설정")
         return parsed_prices, komis_sentiment, recent_reports
 
     try:
@@ -75,6 +75,7 @@ def fetch_komis_mail_data():
         mail.login(GMAIL_USER, GMAIL_APP_PASS)
         mail.select("inbox")
 
+        # KOMIS 발신 메일 우선 검색
         status, messages = mail.search(None, '(FROM "komis")')
         msg_ids = messages[0].split() if status == "OK" and messages[0] else []
 
@@ -117,7 +118,7 @@ def fetch_komis_mail_data():
             soup = BeautifulSoup(body, "html.parser")
             tables = soup.find_all("table")
 
-            # 1. 가격 표 파싱
+            # 1. 공시 단가 및 등락률 파싱
             for tr in soup.find_all("tr"):
                 cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
                 if len(cells) >= 3:
@@ -146,7 +147,7 @@ def fetch_komis_mail_data():
                         except Exception as e:
                             print(f"[{item_name}] 가격 파싱 오류: {e}")
 
-            # 2. 시장동향지표 파싱 (헤더: 리튬, 니켈, 유연탄, 철, 우라늄, 아연, 흑연)
+            # 2. 시장동향지표 파싱 (니켈, 아연, 철 등)
             for table in tables:
                 header_text = table.get_text()
                 if "시장동향지표" in header_text or "중립" in header_text or "신중" in header_text:
@@ -162,7 +163,7 @@ def fetch_komis_mail_data():
                     if komis_sentiment:
                         break
 
-            # 3. 최근 자원동향 보고서 제목 파싱
+            # 3. 최근 자원동향 보고서 주요 브리프 파싱
             for table in tables:
                 table_text = table.get_text()
                 if "최근 자원동향" in table_text or "주간자원뉴스" in table_text:
@@ -178,18 +179,19 @@ def fetch_komis_mail_data():
             if komis_sentiment:
                 print(f"✓ [KOMIS 시장동향지표] {komis_sentiment}")
             if recent_reports:
-                print(f"✓ [KOMIS 최근동향 보고서] {recent_reports[:2]}")
+                print(f"✓ [KOMIS 최근동향 보고서] 수집 완료 ({len(recent_reports)}건)")
 
             if "니켈(Ni)" in parsed_prices and "아연(Zn)" in parsed_prices:
                 break
 
         mail.logout()
     except Exception as e:
-        print(f"[KOMIS 파싱 예외] {e}")
+        print(f"[KOMIS 메일 파싱 예외] {e}")
 
     return parsed_prices, komis_sentiment, recent_reports
 
 def get_yfinance_price(ticker_symbol):
+    """Yahoo Finance 선물 시세 수집"""
     try:
         ticker = yf.Ticker(ticker_symbol)
         hist = ticker.history(period="5d")
@@ -205,6 +207,7 @@ def get_yfinance_price(ticker_symbol):
     return 0.0, "+0.00%"
 
 def get_naphtha_price():
+    """나프타: 브렌트유 * 8.5 배수 연동 산출"""
     try:
         ticker = yf.Ticker("BZ=F")
         hist = ticker.history(period="5d")
@@ -251,7 +254,7 @@ def fetch_latest_market_news(conf):
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
 def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, komis_sentiment, recent_reports):
-    """KOMIS 공식 시장동향지표 및 최근 동향 보고서를 반영한 심층 시황 요약"""
+    """신규 Google GenAI SDK를 이용한 정밀 시황 요약 분석"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -260,20 +263,19 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
     except Exception:
         direction_text = "보합 마감"
 
-    # KOMIS 지표 및 보고서 맥락 주입
+    # KOMIS 공시 지표 및 보고서 맥락 주입
     komis_context = []
     short_key = item_name.split("(")[0]
     if short_key in komis_sentiment:
         komis_context.append(f"KOMIS 공식 시장동향지표: {short_key} {komis_sentiment[short_key]}")
     if recent_reports:
-        komis_context.append(f"최근 광물자원 동향 보고서 이슈: {', '.join(recent_reports[:2])}")
+        # 보고서 문단 핵심 요약 (앞부분 150자 반영)
+        brief_text = " / ".join([r[:150] for r in recent_reports[:2]])
+        komis_context.append(f"KOMIS 최신 자원동향 브리프: {brief_text}")
     
     komis_str = "\n".join([f"- {k}" for k in komis_context])
 
-    # 지원 모델 목록 (정식 별칭 우선 적용)
-    models_to_try = ["gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro-latest", "gemini-pro"]
-
-    if GEMINI_API_KEY:
+    if gemini_client:
         prompt = f"""
 당신은 원자재 및 공급망 전문 수석 애널리스트입니다.
 오늘은 [{today_str}]이며, 분석 대상 품목은 [{item_name}]입니다.
@@ -284,28 +286,32 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
 - 글로벌 시장 뉴스 헤드라인: {news_context}
 
 [작성 지침]:
-1. 단순 일반론을 배제하고, 수집된 뉴스 이슈(산유국 정책, 공급 쇼크, 제련수수료, 차익 실현 등)나 KOMIS 지표(신중/중립/관심)의 맥락을 구체적으로 반영하세요.
+1. 일반론은 배제하고, 수집된 KOMIS 지표 단계(중립/신중/관심)나 자원동향(전력 수요, 공급 차질, 가동률 등) 및 뉴스 이슈를 직접 연계하세요.
 2. 경영진 보고용 격식체 한국어 1문장(50~80자 내외)으로 작성하세요.
-3. 반드시 "시황 요약: [구체적 원인 및 시장 이슈] 영향으로 {direction_text}" 형식으로만 답변하세요.
+3. 반드시 "시황 요약: [원인 및 시장 이슈] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-        for model_name in models_to_try:
+        # 최신 모델 식별자 순차 시도
+        for model_id in ["gemini-2.5-flash", "gemini-1.5-flash"]:
             try:
-                m = genai.GenerativeModel(model_name)
-                res = m.generate_content(prompt, request_options={"timeout": 20}).text.strip().replace("\n", " ").replace("*", "")
+                response = gemini_client.models.generate_content(
+                    model=model_id,
+                    contents=prompt
+                )
+                res = response.text.strip().replace("\n", " ").replace("*", "")
                 if res:
-                    clean_res = res.strip()
-                    formatted = clean_res if clean_res.startswith("시황 요약:") else f"시황 요약: {clean_res}"
-                    print(f"✓ [{item_name}] Gemini({model_name}) 심층 요약 성공: {formatted}")
+                    formatted = res if res.startswith("시황 요약:") else f"시황 요약: {res}"
+                    print(f"✓ [{item_name}] Gemini({model_id}) 요약 성공: {formatted}")
                     return formatted
             except Exception as e:
-                print(f"[{item_name}] Gemini 모델({model_name}) 호출 실패: {e}")
+                print(f"[{item_name}] Gemini({model_id}) 호출 실패: {e}")
                 continue
 
-    # 비상용 폴백 문구
+    # 폴백 문구
     sentiment_fallback = f"KOMIS {komis_sentiment.get(short_key, '시장')} 지표 추이 및 " if short_key in komis_sentiment else ""
     return f"시황 요약: {sentiment_fallback}글로벌 수급 변동 영향으로 {direction_text}"
 
 def get_latest_sheet_prices(sheet):
+    """시트에 누적된 직전 실제 거래 단가 조회"""
     latest_prices = {}
     try:
         records = sheet.get_all_values()
