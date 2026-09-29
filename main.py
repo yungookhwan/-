@@ -254,7 +254,7 @@ def fetch_latest_market_news(conf):
     return " / ".join(titles) if titles else "글로벌 거시 경제 지표 발표 및 주요 선물거래소 수급 변동성 확대"
 
 def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, komis_sentiment, recent_reports):
-    """신규 Google GenAI SDK를 이용한 정밀 시황 요약 분석"""
+    """신규 Google GenAI SDK를 이용한 정밀 시황 요약 분석 (503 자동 재시도 포함)"""
     news_context = fetch_latest_market_news(conf)
 
     try:
@@ -263,7 +263,6 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
     except Exception:
         direction_text = "보합 마감"
 
-    # KOMIS 공시 지표 및 보고서 맥락 주입
     komis_context = []
     short_key = item_name.split("(")[0]
     if short_key in komis_sentiment:
@@ -289,21 +288,27 @@ def analyze_news_with_gemini(item_name, conf, price_str, change_str, today_str, 
 2. 경영진 보고용 격식체 한국어 1문장(50~80자 내외)으로 작성하세요.
 3. 반드시 "시황 요약: [원인 및 시장 이슈] 영향으로 {direction_text}" 형식으로만 답변하세요.
 """
-        # 로그에서 명시적으로 요구한 gemini-3.8-flash 적용
-        for model_id in ["gemini-3.8-flash", "gemini-2.0-flash"]:
+        # 503 일시적 과부하 대응: 최대 3회 재시도 (Exponential Backoff)
+        for attempt in range(3):
             try:
                 response = gemini_client.models.generate_content(
-                    model=model_id,
+                    model="gemini-3.8-flash",
                     contents=prompt
                 )
                 res = response.text.strip().replace("\n", " ").replace("*", "")
                 if res:
                     formatted = res if res.startswith("시황 요약:") else f"시황 요약: {res}"
-                    print(f"✓ [{item_name}] Gemini({model_id}) 요약 성공: {formatted}")
+                    print(f"✓ [{item_name}] Gemini(gemini-3.8-flash) 요약 성공: {formatted}")
                     return formatted
             except Exception as e:
-                print(f"[{item_name}] Gemini({model_id}) 호출 실패: {e}")
-                continue
+                err_msg = str(e)
+                if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                    wait_time = (attempt + 1) * 3  # 3초, 6초 대기 후 재시도
+                    print(f"[{item_name}] 서버 일시 과부하(503). {wait_time}초 후 재시도... (시도 {attempt+1}/3)")
+                    time.sleep(wait_time)
+                else:
+                    print(f"[{item_name}] Gemini 호출 실패: {e}")
+                    break
 
     # 폴백 문구
     sentiment_fallback = f"KOMIS {komis_sentiment.get(short_key, '시장')} 지표 추이 및 " if short_key in komis_sentiment else ""
