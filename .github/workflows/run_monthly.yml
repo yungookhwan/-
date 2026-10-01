@@ -33,4 +33,4 @@ jobs:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
         run: |
-          python monthly.py
+         python backfill_monthly.py
