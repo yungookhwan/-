@@ -3,8 +3,8 @@ name: Commodity Data Collector
 on:
   workflow_dispatch: # Actions 탭에서 수동 실행 버튼 활성화
   schedule:
-    # 매일 평일(월~금) 한국 시간 오전 10시 45분 실행 (KOMIS 메일 수신 후 반영)
-    - cron: '45 1 * * 1-5'
+    # 매일 평일(월~금) 한국 시간 오전 10시 48분 실행 (피크 타임 분산 & KOMIS 메일 수신 후 반영)
+    - cron: '48 1 * * 1-5'
 
 jobs:
   run-pipeline:
@@ -28,6 +28,6 @@ jobs:
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}            # ★ 메일 파싱 계정
-          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}    # ★ 16자리 앱 비밀번호
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASS: ${{ secrets.GMAIL_APP_PASS }}
         run: python main.py
