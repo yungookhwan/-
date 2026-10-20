@@ -1,0 +1,38 @@
+name: 외주공사 기성 집계 자동화 파이프라인
+
+on:
+  push:
+    paths:
+      - 'data/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: 파이썬 셋업
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 라이브러리 설치
+        run: |
+          pip install openpyxl pandas
+
+      - name: 기성 집계 스크립트 실행
+        run: |
+          python scripts/batch_billing_processor.py
+
+      - name: 결과 마스터 파일 깃허브 자동 커밋
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update: 기성집계 마스터 갱신" && git push)
